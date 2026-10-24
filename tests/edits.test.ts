@@ -10,7 +10,8 @@ const PANE = {
 // An in-memory disk standing in for the file system, git (a repo at /repo when `isRepo`) and the session.
 const fake = (on: any, isRepo: boolean) => {
   const disk = new Map<string, string>()
-  const repo = { head: 'aaaaaaa First commit' }
+  // Commits newest first, each with its time in seconds.
+  const repo = { commits: [['aaaaaaa', 0, 'First commit']] as [string, number, string][] }
   const found = (path: string) => {
     const text = disk.get(path)
     if (text === undefined) throw new Error('missing')
@@ -34,7 +35,7 @@ const fake = (on: any, isRepo: boolean) => {
     if (e.argv[0] === 'printenv') return done(0, '/home/me\n')
     if (!isRepo) return done(128)
     if (e.argv[1] === 'rev-parse') return done(0, '/repo\n')
-    if (e.argv[1] === 'log') return done(0, `${repo.head}\n`)
+    if (e.argv[1] === 'log') return done(0, repo.commits.map(c => `${c.join('\0')}\n`).join(''))
     if (e.argv[1] === 'status') {
       const files = [...disk.keys()].filter(f => f.startsWith('/repo/'))
 
@@ -109,25 +110,33 @@ test('edits list newest first, step through time, fold, and show the whole file'
   expect((await rows(after))[0]).toBe('▸ /repo/b.txt +1 -1 deleted (2 edits)')
   await after.unmount()
 
-  // A commit after a file's last edit draws a break as soon as a shell command has run.
-  repo.head = 'bbbbbbb Add docstring'
+  // The files view lists each file once; the commits view lists each commit's files under a line naming it.
+  const listed = async (ui: any) =>
+    (await ui.findAll({ type: 'Text' }))
+      .map((t: any) => t.text)
+      .filter((t: string) => /^[▸▾] /.test(t))
+      .map((t: string) => (/─$/.test(t) ? t.replace(/ ─+$/, '') : t.split(' ')[1]))
+  repo.commits.unshift(['bbbbbbb', Date.now() / 1000, 'Add docstring'])
   await call('Bash', { command: 'git commit -am "Add docstring"' }, () => {})
-  const committed = await mount($, 40)
-  await committed.press({ key: 'toggle:/repo/a.py' })
-  const shown = (await committed.findAll({ type: 'Text' })).map((t: any) => t.text)
-  expect(shown.filter((t: string) => t.startsWith('──'))).toEqual(['── bbbbbbb Add docstring ────────────'])
-  await committed.press({ key: 'toggle:/repo/a.py' })
-  await committed.unmount()
-
-  // A later edit keeps the break, now between the two edits.
   await call('Bash', { command: "sed -i 's/one/One/' a.py" }, () => {
     disk.set('/repo/a.py', 'def f():\n    """Return One."""\n    return 1\n')
   })
-  const broken = await mount($, 40)
-  await broken.press({ key: 'toggle:/repo/a.py' })
-  const texts = (await broken.findAll({ type: 'Text' })).map((t: any) => t.text)
-  expect(texts.filter((t: string) => t.startsWith('──'))).toEqual(['── bbbbbbb Add docstring ────────────'])
-  await broken.unmount()
+  const committed = await mount($, 40)
+  expect(await listed(committed)).toEqual(['/repo/a.py', '/repo/b.txt'])
+  await committed.press({ key: 'view:commits' })
+  expect(await listed(committed)).toEqual(['▾ uncommitted', '/repo/a.py', '▾ bbbbbbb Add docstring', '/repo/b.txt', '/repo/a.py'])
+
+  // A commit folds its files away behind its line.
+  await committed.press({ key: 'commit:bbbbbbb Add docstring' })
+  expect(await listed(committed)).toEqual(['▾ uncommitted', '/repo/a.py', '▸ bbbbbbb Add docstring (2 files)'])
+  await committed.press({ key: 'commit:bbbbbbb Add docstring' })
+
+  // A file under a commit steps through only that commit's edits, numbered as in its whole history.
+  await committed.press({ key: 'toggle:bbbbbbb Add docstring\t/repo/a.py' })
+  const picked = (await committed.findAll({ type: 'Button' })).filter((b: any) => /^rec:/.test(b.key))
+  expect(picked.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['○ #1 T write +2 -0', '● #2 T shell +1 -0'])
+  await committed.press({ key: 'view:files' })
+  await committed.unmount()
 
   // Two changes far apart are two hunks, each with up to 3 lines of context.
   const lines = Array.from({ length: 20 }, (_, k) => `line ${k + 1}`)

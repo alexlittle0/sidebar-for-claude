@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FileEdit, FileFocus, Hunk } from '../types'
+import type { Commit, FileEdit, FileFocus, Hunk } from '../types'
 
 const PANE = 'edits'
 const MAX_EDITS = 200
@@ -17,8 +17,11 @@ const TOOL_LABEL = { Edit: 'edit', Write: 'write', Bash: 'shell' }
 const edits = atom({ plugin: 'edit-tracker-for-claude', key: 'edits' } as const, [])
 const expanded = atom({ plugin: 'edit-tracker-for-claude', key: 'expanded' } as const, [])
 const focus = atom({ plugin: 'edit-tracker-for-claude', key: 'focus' } as const, {} as Record<string, FileFocus>)
-// Each file's repository commit as last checked: file → "a1b2c3d Subject".
-const heads = atom({ plugin: 'edit-tracker-for-claude', key: 'heads' } as const, {} as Record<string, string>)
+const commits = atom({ plugin: 'edit-tracker-for-claude', key: 'commits' } as const, [] as Commit[])
+// The pane lists each file once, or the files of each commit.
+const view = atom({ plugin: 'edit-tracker-for-claude', key: 'view' } as const, 'files' as 'files' | 'commits')
+// The commits folded away in the commits view.
+const folded = atom({ plugin: 'edit-tracker-for-claude', key: 'folded' } as const, [] as string[])
 
 // A text's lines; a final newline ends the last line rather than starting another.
 const toLines = (text: string) => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
@@ -199,12 +202,29 @@ const committed = async ($: EngineInterface, file: string) => {
   return run?.exitCode === 0 ? run.stdout : ''
 }
 
-// The commit of the repository holding `file`, "a1b2c3d Subject", or '' outside git.
-const headOf = async ($: EngineInterface, file: string) => {
+// Reads the commits made since the first tracked edit in the repository holding `file`, timed by git.
+const checkCommit = async ($: EngineInterface, file: string) => {
+  const list = await read($, edits)
+  if (list.length === 0) return
+  const since = Math.min(...list.map(edit => edit.at))
   const dir = file.slice(0, file.lastIndexOf('/')) || '/'
-  const log = await $.process.run(['git', 'log', '-1', '--format=%h %s'], { cwd: dir }).catch(() => null)
+  const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir }).catch(() => null)
+  if (top?.exitCode !== 0) return
+  const root = top.stdout.trim()
+  const log = await $.process.run(['git', 'log', '-50', '--format=%h%x00%ct%x00%s'], { cwd: root }).catch(() => null)
+  if (log?.exitCode !== 0) return
+  const found = log.stdout
+    .split('\n')
+    .filter(line => line.includes('\0'))
+    .map(line => {
+      const [hash, time, subject] = line.split('\0')
 
-  return log?.exitCode === 0 ? log.stdout.trim() : ''
+      return { commit: `${hash} ${subject}`, root, at: Number(time) * 1000 }
+    })
+    .filter(c => c.at >= since)
+  const was = (await read($, commits)).filter(c => c.root === root)
+  if (JSON.stringify(was.map(c => c.commit)) === JSON.stringify(found.map(c => c.commit).reverse())) return
+  await update($, commits, cur => [...cur.filter(c => c.root !== root), ...found.reverse()])
 }
 
 const savePath = async ($: EngineInterface) => {
@@ -222,6 +242,8 @@ const record = async (
   after: string | null,
   fallback: Hunk[] = [],
 ) => {
+  // A commit made since the last check lands before this edit.
+  await checkCommit($, change.file)
   const all = before !== null && after !== null ? diffTexts(before, after) : fallback
   const edit: FileEdit = { ...change, added: 0, removed: 0, hunks: [], at: await $.clock.now().catch(() => Date.now()) }
   let kept = 0
@@ -234,9 +256,7 @@ const record = async (
       kept += hunk.lines.length
     }
   }
-  const commit = await headOf($, edit.file)
   // State holds plain JSON: absent fields are left out, never undefined.
-  if (commit) edit.commit = commit
   if (before !== null && before.length <= MAX_SNAPSHOT) edit.before = before
   if (after !== null && after.length <= MAX_SNAPSHOT) edit.after = after
 
@@ -267,6 +287,13 @@ const record = async (
 }
 
 // Puts the saved edits back when the pane's history is empty.
+// Checks each folder holding tracked files once.
+const checkCommits = async ($: EngineInterface) => {
+  const folders = new Map<string, string>()
+  for (const edit of await read($, edits)) folders.set(edit.file.slice(0, edit.file.lastIndexOf('/')), edit.file)
+  for (const file of folders.values()) await checkCommit($, file)
+}
+
 const restore = async ($: EngineInterface) => {
   if ((await read($, edits)).length > 0) return
   try {
@@ -287,6 +314,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     await restore($)
+    await checkCommits($).catch(() => {})
     await $.command.register({ name: 'edits', description: 'Show the files Claude edited this session, with their diffs' })
     void $.ui.open({ id: PANE, title: 'Edits' })
 
@@ -295,6 +323,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'edits' }, async $ => {
     await restore($)
+    await checkCommits($).catch(() => {})
     await $.ui.open({ id: PANE, title: 'Edits' })
 
     return { text: 'Edits pane opened.' }
@@ -360,18 +389,8 @@ export const register: Register = on => {
         }
       }
 
-      // The command may have committed: note each file's current commit, one git call per folder.
-      const latest = new Map<string, string>()
-      for (const edit of await read($, edits)) if (edit.commit) latest.set(edit.file, edit.commit)
-      const byDir = new Map<string, string>()
-      const now: Record<string, string> = {}
-      for (const file of latest.keys()) {
-        const folder = file.slice(0, file.lastIndexOf('/'))
-        if (!byDir.has(folder)) byDir.set(folder, await headOf($, file))
-        if (byDir.get(folder)) now[file] = byDir.get(folder)!
-      }
-      const was = await read($, heads)
-      if (Object.keys(now).some(f => was[f] !== now[f])) await update($, heads, () => now)
+      // The command may have committed.
+      await checkCommits($)
     } catch {
       // As above.
     }
@@ -412,23 +431,71 @@ export const register: Register = on => {
 
     const open = await read($, expanded)
     const focused = await read($, focus)
-    const current = await read($, heads)
-    const breakLine = (commit: string) => (
-      <Text color="warning" wrap="truncate-end">
-        {`── ${commit} ${'─'.repeat(Math.max(0, columns - commit.length - 6))}`}
-      </Text>
-    )
+    const by = await read($, view)
+    const shut = await read($, folded)
     // One column spare so a row never touches the edge and wraps.
     const columns = Math.max(4, (e.props.bodyColumns ?? 40) - 1)
+    // A commit's line, pressed to fold its files away or back.
+    const breakLine = (label: string, count: number) => {
+      const isShut = shut.includes(label)
+      const text = `${isShut ? '▸' : '▾'} ${label}${isShut ? ` (${count} file${count === 1 ? '' : 's'})` : ''}`
 
-    // One entry per file, the most recently edited first.
-    const byFile = new Map<string, FileEdit[]>()
-    for (const edit of list) {
-      const fileEdits = byFile.get(edit.file) ?? []
-      byFile.delete(edit.file)
-      byFile.set(edit.file, [...fileEdits, edit])
+      return (
+        <Button
+          key={`commit:${label}`}
+          plain
+          onPress={() => update($, folded, cur => (cur.includes(label) ? cur.filter(l => l !== label) : [...cur, label]))}
+        >
+          <Text dimColor wrap="truncate-end">{`${text} ${'─'.repeat(Math.max(0, columns - text.length - 1))}`}</Text>
+        </Button>
+      )
     }
-    const files = [...byFile.entries()].reverse()
+
+    // Groups edits by file, the most recently edited first.
+    const group = (some: FileEdit[]) => {
+      const byFile = new Map<string, FileEdit[]>()
+      for (const edit of some) {
+        const fileEdits = byFile.get(edit.file) ?? []
+        byFile.delete(edit.file)
+        byFile.set(edit.file, [...fileEdits, edit])
+      }
+
+      return [...byFile.entries()].reverse()
+    }
+    const files = group(list)
+    // Each edit's number in its file's whole history, and the file's copy before it.
+    const number = new Map<string, number>()
+    const previous = new Map<string, string | undefined>()
+    for (const [, fileEdits] of files) {
+      fileEdits.forEach((edit, k) => {
+        number.set(edit.id, k + 1)
+        previous.set(edit.id, fileEdits[k - 1]?.after)
+      })
+    }
+
+    // The rows to show: each file once, or each commit's files under a line naming it.
+    type Row = { key: string; file: string; fileEdits: FileEdit[]; bucket?: string; header?: number }
+    let rows: Row[] = files.map(([file, fileEdits]) => ({ key: file, file, fileEdits }))
+    if (by === 'commits') {
+      // An edit belongs to the first commit after it in its repository; later edits are uncommitted.
+      const all = (await read($, commits)).sort((a, b) => a.at - b.at)
+      const buckets = new Map<string, FileEdit[]>()
+      for (const edit of list) {
+        const commit = all.find(c => edit.file.startsWith(`${c.root}/`) && c.at >= edit.at)
+        const label = commit ? commit.commit : 'uncommitted'
+        buckets.set(label, [...(buckets.get(label) ?? []), edit])
+      }
+      const labels = [...buckets.keys()].sort((a, b) => {
+        const time = (label: string) => (label === 'uncommitted' ? Infinity : all.find(c => c.commit === label)!.at)
+
+        return time(b) - time(a)
+      })
+      rows = labels.flatMap(label =>
+        group(buckets.get(label)!).map(([file, fileEdits], k, all) => ({
+          key: `${label}\t${file}`, file, fileEdits, bucket: label, header: k === 0 ? all.length : undefined,
+        })),
+      )
+    }
 
     const setFocus = (file: string, change: Partial<FileFocus>) =>
       update($, focus, cur => ({ ...cur, [file]: { mode: 'diff', ...cur[file], ...change } }))
@@ -437,11 +504,23 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Text bold>
-          {files.length} file{files.length === 1 ? '' : 's'}
-        </Text>
-        {files.map(([file, fileEdits]) => {
-          const isOpen = open.includes(file)
+        <Box flexWrap="nowrap">
+          <Text bold>
+            {files.length} file{files.length === 1 ? '' : 's'}
+          </Text>
+          <Text dimColor> │ </Text>
+          <Button key="view:files" plain onPress={() => update($, view, () => 'files')}>
+            <Text bold={by === 'files'} dimColor={by !== 'files'} underline={by === 'files'}>files</Text>
+          </Button>
+          <Text> </Text>
+          <Button key="view:commits" plain onPress={() => update($, view, () => 'commits')}>
+            <Text bold={by === 'commits'} dimColor={by !== 'commits'} underline={by === 'commits'}>commits</Text>
+          </Button>
+        </Box>
+        {rows.map(({ key, file, fileEdits, bucket, header }) => {
+          // A folded commit shows only its line.
+          if (bucket !== undefined && shut.includes(bucket)) return header !== undefined && breakLine(bucket, header)
+          const isOpen = open.includes(key)
           const added = fileEdits.reduce((n, x) => n + x.added, 0)
           const removed = fileEdits.reduce((n, x) => n + x.removed, 0)
           const latest = fileEdits[fileEdits.length - 1]
@@ -461,7 +540,7 @@ export const register: Register = on => {
           const path = fitPath(file, room + name.length)
 
           // The chosen edit (the latest unless picked) and how it is shown.
-          const at = focused[file]
+          const at = focused[key]
           const found = fileEdits.findIndex(x => x.id === at?.id)
           const idx = found === -1 ? fileEdits.length - 1 : found
           const edit = fileEdits[idx]
@@ -470,7 +549,7 @@ export const register: Register = on => {
           const isLatest = idx === fileEdits.length - 1
           // Picking another edit shows it; picking the shown one again folds it away.
           const pick = (k: number) =>
-            setFocus(file, k === idx ? { isHidden: !isHidden } : { id: fileEdits[k].id, isHidden: false })
+            setFocus(key, k === idx ? { isHidden: !isHidden } : { id: fileEdits[k].id, isHidden: false })
 
           let view = <Text dimColor>No textual changes.</Text>
           if (mode === 'diff' && edit.hunks.length > 0) {
@@ -481,7 +560,7 @@ export const register: Register = on => {
             view = <Text dimColor>No copy of the whole file was kept for this edit (only the last {SNAPSHOTS_PER_FILE} edits of a file, up to {MAX_SNAPSHOT / 1000}k characters).</Text>
           } else if (mode === 'file' && edit.after !== undefined) {
             // The whole file right after the edit, its changed lines marked.
-            const before = edit.before ?? fileEdits[idx - 1]?.after
+            const before = edit.before ?? previous.get(edit.id)
             const whole = before === undefined ? [] : diffTexts(before, edit.after, WHOLE_FILE)
             view = whole.length > 0
               ? <Code source={diffSource(whole)} format="diff" path={file} />
@@ -489,8 +568,9 @@ export const register: Register = on => {
           }
 
           return (
-            <Box key={`f:${file}`} flexDirection="column">
-              <Button key={`toggle:${file}`} plain onPress={() => toggle(file)}>
+            <Box key={`f:${key}`} flexDirection="column">
+              {bucket !== undefined && header !== undefined && breakLine(bucket, header)}
+              <Button key={`toggle:${key}`} plain onPress={() => toggle(key)}>
                 <Text wrap="truncate-end">
                   {isOpen ? '▾' : '▸'} <Text bold={isOpen}>{path}</Text>
                   {showStats && <Text color="success"> +{added}</Text>}
@@ -501,46 +581,36 @@ export const register: Register = on => {
               </Button>
               {isOpen && (
                 <Box flexDirection="column" paddingLeft={2}>
-                  {fileEdits.map((one, k) => {
-                    const prev = fileEdits[k - 1]
-                    // A commit landed between the two edits: draw a break with it.
-                    const commit = prev?.commit && one.commit && prev.commit !== one.commit ? one.commit : ''
-
-                    return (
-                      <Box key={`r:${one.id}`} flexDirection="column">
-                        {commit && breakLine(commit)}
-                        <Button key={`rec:${one.id}`} plain onPress={() => pick(k)}>
-                          <Text wrap="truncate-end" bold={k === idx} dimColor={k !== idx}>
-                            {k === idx ? '●' : '○'} #{k + 1} {clockTime(one.at)} {TOOL_LABEL[one.tool]}
-                            <Text color="success"> +{one.added}</Text>
-                            <Text color="error"> -{one.removed}</Text>
-                            {one.isDeleted && <Text color="error"> deleted</Text>}
-                          </Text>
-                        </Button>
-                      </Box>
-                    )
-                  })}
-                  {latest.commit && current[file] && current[file] !== latest.commit && breakLine(current[file])}
+                  {fileEdits.map((one, k) => (
+                    <Button key={`rec:${one.id}`} plain onPress={() => pick(k)}>
+                      <Text wrap="truncate-end" bold={k === idx} dimColor={k !== idx}>
+                        {k === idx ? '●' : '○'} #{number.get(one.id)} {clockTime(one.at)} {TOOL_LABEL[one.tool]}
+                        <Text color="success"> +{one.added}</Text>
+                        <Text color="error"> -{one.removed}</Text>
+                        {one.isDeleted && <Text color="error"> deleted</Text>}
+                      </Text>
+                    </Button>
+                  ))}
                   <Box flexWrap="nowrap">
-                    <Button key={`fold:${file}`} plain onPress={() => setFocus(file, { isHidden: !isHidden })}>
+                    <Button key={`fold:${key}`} plain onPress={() => setFocus(key, { isHidden: !isHidden })}>
                       <Text dimColor>{isHidden ? '▸ show' : '▾ hide'}</Text>
                     </Button>
                     <Text dimColor> │ </Text>
-                    {idx > 0 ? <Button key={`older:${file}`} label="◀" plain onPress={() => pick(idx - 1)} /> : <Text dimColor>◀</Text>}
+                    {idx > 0 ? <Button key={`older:${key}`} label="◀" plain onPress={() => pick(idx - 1)} /> : <Text dimColor>◀</Text>}
                     <Text> </Text>
-                    {!isLatest ? <Button key={`newer:${file}`} label="▶" plain onPress={() => pick(idx + 1)} /> : <Text dimColor>▶</Text>}
+                    {!isLatest ? <Button key={`newer:${key}`} label="▶" plain onPress={() => pick(idx + 1)} /> : <Text dimColor>▶</Text>}
                     <Text> </Text>
                     {!isLatest ? (
-                      <Button key={`latest:${file}`} label="latest" plain onPress={() => pick(fileEdits.length - 1)} />
+                      <Button key={`latest:${key}`} label="latest" plain onPress={() => pick(fileEdits.length - 1)} />
                     ) : (
                       <Text dimColor>latest</Text>
                     )}
                     <Text dimColor> │ </Text>
-                    <Button key={`diff:${file}`} plain onPress={() => setFocus(file, { mode: 'diff', isHidden: false })}>
+                    <Button key={`diff:${key}`} plain onPress={() => setFocus(key, { mode: 'diff', isHidden: false })}>
                       <Text bold={mode === 'diff'} dimColor={mode !== 'diff'} underline={mode === 'diff'}>diff</Text>
                     </Button>
                     <Text> </Text>
-                    <Button key={`file:${file}`} plain onPress={() => setFocus(file, { mode: 'file', isHidden: false })}>
+                    <Button key={`file:${key}`} plain onPress={() => setFocus(key, { mode: 'file', isHidden: false })}>
                       <Text bold={mode === 'file'} dimColor={mode !== 'file'} underline={mode === 'file'}>file</Text>
                     </Button>
                   </Box>
