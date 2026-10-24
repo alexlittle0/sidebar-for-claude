@@ -1,0 +1,1 @@
+{ "name": "edit-tracker-for-claude", "version": "0.1.0", "description": "A side pane that lists the files Claude edited this session and shows their diffs", "types": "./types/index.d.ts" }
