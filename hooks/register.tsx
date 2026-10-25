@@ -559,7 +559,7 @@ export const register: Register = on => {
     let dirty = new Map<string, string>()
     let dir = ''
     try {
-      const command = String(e.input.command ?? '')
+      const command = String(e.command ?? '')
       const line = command.split('\n').map(l => l.trim()).find(Boolean)
       if (line) await whileRunning($, p => ({ ...p, commands: [...(p.commands ?? []), cut(line, MAX_COMMAND)].slice(-MAX_COMMANDS) }))
       const homeDir = await getHome($)
@@ -824,7 +824,6 @@ export const register: Register = on => {
     // What a group's line says, when not its label, and the prompt a prompt's group is for.
     const titles = new Map<string, string>()
     const promptOf = new Map<string, Prompt>()
-    const editsOf = new Map<string, FileEdit[]>()
     // A prompt's or commit's line, pressed to fold its files away or back; a commit's ends in a button
     // that reverts it on a second press.
     const breakLine = (label: string, count: number) => {
@@ -935,37 +934,16 @@ export const register: Register = on => {
         promptOf.set(`prompt:${p.at}`, p)
       }
       latest = asked.at(-1)
-      for (const [label, some] of buckets) editsOf.set(label, some)
       titles.set('earlier', 'before the first prompt seen')
       const time = (label: string) => (label === 'earlier' ? -Infinity : Number(label.slice('prompt:'.length)))
       rows = under([...buckets.keys()].sort((a, b) => time(b) - time(a)), buckets)
     }
 
-    // Asks Claude about a prompt's changes, or to commit them, naming each file it changed with the diff over all of
-    // the prompt's edits to it (from the copy before the first to the copy after the last, when both were kept).
-    const askAbout = (p: Prompt, some: FileEdit[], ask: string) => {
-      let room = MAX_DIFF_LINES
-      const parts = group(some).map(([file, fileEdits]) => {
-        const first = fileEdits[0]
-        const last = fileEdits[fileEdits.length - 1]
-        const before = first.isNew ? '' : (first.before ?? previous.get(first.id))
-        const hunks = before !== undefined && last.after !== undefined ? diffTexts(before, last.after) : fileEdits.flatMap(x => x.hunks)
-        const size = hunks.reduce((n, h) => n + h.lines.length, 0)
-        if (hunks.length === 0 || size > room) return `${file}${hunks.length > 0 ? ' (diff left out, too long)' : ''}`
-        room -= size
-
-        return `${file}\n\`\`\`diff\n${diffSource(hunks)}\n\`\`\``
-      })
-
-      return $.prompt.submit({ text: [`${ask} My prompt was (at ${clockTime(p.at)}):`, '', p.full ?? p.text, '', 'The files it changed:', '', ...parts].join('\n') })
-    }
-
     // An open prompt's turn under its line: the whole prompt when longer than the line, how long the turn took,
-    // the shell commands it ran, and buttons asking Claude about its changes or to commit them.
+    // and the shell commands it ran.
     const about = (label: string) => {
       const p = promptOf.get(label)
       if (!p) return null
-      const some = editsOf.get(label) ?? []
       const ran = p.commands ?? []
       const status = p.ms !== undefined
         ? `${p.isAborted ? 'interrupted after' : 'took'} ${duration(p.ms)}`
@@ -980,30 +958,6 @@ export const register: Register = on => {
             <Text key={`ran:${label}:${k}`} dimColor wrap="truncate-end">{`$ ${command}`}</Text>
           ))}
           {ran.length > SHOWN_COMMANDS && <Text dimColor>… {ran.length - SHOWN_COMMANDS} more</Text>}
-          {some.length > 0 && (
-            <Box flexWrap="nowrap">
-              <Button
-                key={`why:${label}`}
-                plain
-                onPress={() => askAbout(p, some, 'Explain what you changed for this prompt of mine and why, then review the changes for problems.')}
-              >
-                <Text color="suggestion">why?</Text>
-              </Button>
-              <Text dimColor> │ </Text>
-              <Button
-                key={`commitprompt:${label}`}
-                plain
-                onPress={() =>
-                  askAbout(p, some, [
-                    'Commit the changes you made for this prompt of mine: only the files below, nothing else in the working tree.',
-                    'Write the commit message from what changed and why. If a file also holds changes made for other prompts, tell me before committing.',
-                  ].join(' '))
-                }
-              >
-                <Text color="suggestion">commit these files</Text>
-              </Button>
-            </Box>
-          )}
         </Box>
       )
     }

@@ -116,7 +116,7 @@ test('edits list newest first, step through time, fold, and show the whole file'
   const { disk, repo, setEffect } = fake(on, true)
   const call = async (tool: string, input: object, change: () => unknown) => {
     setEffect(change)
-    await $.tool.call({ tool, input } as never)
+    await $.tool.call({ tool, ...input } as never)
   }
 
   await call('Write', { file_path: '/repo/a.py', content: '' }, () => {
@@ -213,7 +213,7 @@ test('outside git, files a shell command names are caught', async ($, on) => {
   disk.set('/home/me/.config/app.conf', 'a = 1\n')
   const bash = async (command: string, change: () => unknown) => {
     setEffect(change)
-    await $.tool.call({ tool: 'Bash', input: { command } } as never)
+    await $.tool.call({ tool: 'Bash', command } as never)
   }
 
   await bash("cd ~/notes && sed -i 's/milk/oat milk/' todo.txt", () => disk.set('/home/me/notes/todo.txt', 'oat milk\n'))
@@ -234,7 +234,7 @@ test('rows stay on one line and keep the file name in a thin pane', async ($, on
 
     return { filePath: file, oldString: 'a', newString: 'b', originalFile: 'a\n', structuredPatch: [] }
   })
-  await $.tool.call({ tool: 'Edit', input: { file_path: file, old_string: 'a', new_string: 'b' } } as never)
+  await $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b' } as never)
 
   for (const [bodyColumns, expected] of [
     [80, '▸ ~/work/some/deeply/nested/folder/register.tsx +1 -1'],
@@ -257,7 +257,7 @@ test('each edit is saved to disk', async ($, on) => {
 
     return { filePath: '/home/me/a.py', oldString: 'a', newString: 'b', originalFile: 'a\n', structuredPatch: [] }
   })
-  await $.tool.call({ tool: 'Edit', input: { file_path: '/home/me/a.py', old_string: 'a', new_string: 'b' } } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/home/me/a.py', old_string: 'a', new_string: 'b' } as never)
 
   const list = JSON.parse(disk.get(saved) ?? '[]')
   expect(list.map((x: any) => [x.file, x.before, x.after])).toEqual([['/home/me/a.py', 'a\n', 'b\n']])
@@ -298,7 +298,7 @@ test('the repo tab shows the folder tree and opens a file', async ($, on) => {
 
     return { filePath: '/repo/src/app.py', oldString: '1', newString: '2', originalFile: 'print(1)\n', structuredPatch: [] }
   })
-  await $.tool.call({ tool: 'Edit', input: { file_path: '/repo/src/app.py', old_string: '1', new_string: '2' } } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src/app.py', old_string: '1', new_string: '2' } as never)
 
   const ui = await mount($)
   await ui.press({ key: 'view:repo' })
@@ -331,7 +331,7 @@ test('an edit can be asked about and opened at its line', async ($, on) => {
   })
   const call = async (tool: string, input: object, change: () => unknown) => {
     setEffect(change)
-    await $.tool.call({ tool, input } as never)
+    await $.tool.call({ tool, ...input } as never)
   }
   await call('Write', { file_path: '/repo/a.py', content: '' }, () => {
     disk.set('/repo/a.py', 'a\nb\nc\n')
@@ -394,11 +394,11 @@ test('a commit is reverted on a second press, in a new commit holding the files 
 
     return { filePath: '/repo/a.py', oldString: 'a', newString: 'b', originalFile: 'a\n', structuredPatch: [] }
   })
-  await $.tool.call({ tool: 'Edit', input: { file_path: '/repo/a.py', old_string: 'a', new_string: 'b' } } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/a.py', old_string: 'a', new_string: 'b' } as never)
   const now = Math.floor(Date.now() / 1000)
   repo.commits.unshift(['bbbbbbb', now + 1, 'Change a'])
   setEffect(() => {})
-  await $.tool.call({ tool: 'Bash', input: { command: 'git commit -am "Change a"' } } as never)
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am "Change a"' } as never)
 
   const ui = await mount($)
   await ui.press({ key: 'view:commits' })
@@ -442,13 +442,8 @@ test('a commit is reverted on a second press, in a new commit holding the files 
 test('the prompts tab groups each prompt\'s files under it, newest first', async ($, on) => {
   const { disk, setEffect } = fake(on, true)
   let now = 1_000_000
-  const asked: string[] = []
   on('clock.now', () => ({ value: now }))
-  on('prompt.submit', ($: unknown, e: any) => {
-    asked.push(e.text)
-
-    return { text: e.text }
-  })
+  on('prompt.submit', ($: unknown, e: any) => ({ text: e.text }))
   const edit = async (file: string, text: string) => {
     now += 1000
     setEffect(() => {
@@ -456,7 +451,7 @@ test('the prompts tab groups each prompt\'s files under it, newest first', async
 
       return { type: 'create', filePath: file, content: text, structuredPatch: [], originalFile: null }
     })
-    await $.tool.call({ tool: 'Write', input: { file_path: file, content: text } } as never)
+    await $.tool.call({ tool: 'Write', file_path: file, content: text } as never)
   }
   // Prompts typed at the terminal, as saved: a test can raise only a plugin's.
   disk.set('/home/me/.local/share/sidebar-for-claude/s1.prompts.json', JSON.stringify([
@@ -485,16 +480,6 @@ test('the prompts tab groups each prompt\'s files under it, newest first', async
     '▾ T Add a parser', '/repo/test_parse.py', '/repo/parse.py',
     '▾ before the first prompt seen', '/repo/old.py',
   ])
-  // A prompt's buttons ask Claude about all of its changes, or to commit them, with each file's diff.
-  await ui.press({ key: 'why:prompt:1002000' })
-  await ui.press({ key: 'commitprompt:prompt:1002000' })
-  const files = ['/repo/test_parse.py', '```diff', '@@ -0,0 +1,1 @@', '+t', '```', '/repo/parse.py', '```diff', '@@ -0,0 +1,1 @@', '+p', '```']
-  expect(asked.slice(1).map(text => text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual([
-    ['Explain what you changed for this prompt of mine and why, then review the changes for problems. My prompt was (at T):',
-      '', 'Add a parser', '', 'The files it changed:', '', ...files].join('\n'),
-    expect.stringMatching(/^Commit the changes you made for this prompt of mine: only the files below.*\n\nAdd a parser\n\nThe files it changed:\n\n\/repo\/test_parse.py\n/),
-  ])
-
   await ui.press({ key: 'commit:prompt:1002000' })
   expect(await lines()).toEqual([
     '▾ T Fix the README', '/repo/README.md', '▸ T Add a parser (2 files)', '▾ before the first prompt seen', '/repo/old.py',
@@ -529,8 +514,8 @@ test('an open prompt shows the whole prompt, how long its turn took and the comm
 
   // The running turn's commands are its prompt's, one line each.
   setEffect(() => disk.set('/repo/README.md', 'r\n'))
-  await $.tool.call({ tool: 'Bash', input: { command: 'cd /repo && echo r > README.md' } } as never)
-  for (let k = 0; k < 9; k++) await $.tool.call({ tool: 'Bash', input: { command: `\n  ls ${k}\n  pwd` } } as never)
+  await $.tool.call({ tool: 'Bash', command: 'cd /repo && echo r > README.md' } as never)
+  for (let k = 0; k < 9; k++) await $.tool.call({ tool: 'Bash', command: `\n  ls ${k}\n  pwd` } as never)
 
   const ui = await mount($, 80, 'prompts')
   const about = async () =>
@@ -544,7 +529,7 @@ test('an open prompt shows the whole prompt, how long its turn took and the comm
   // Its end closes it; a later turn another prompt started (a plugin's) leaves it alone.
   await $.turn.complete({ answer: 'Done.', durationMs: 125_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
   await $.turn.complete({ answer: 'Why.', durationMs: 5_000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
-  await $.tool.call({ tool: 'Bash', input: { command: 'git status' } } as never)
+  await $.tool.call({ tool: 'Bash', command: 'git status' } as never)
   const saved = JSON.parse(disk.get('/home/me/.local/share/sidebar-for-claude/s1.prompts.json')!)
   expect(saved[1].ms).toBe(125_000)
   expect(saved[1].commands.length).toBe(10)
@@ -552,5 +537,17 @@ test('an open prompt shows the whole prompt, how long its turn took and the comm
 
   // A prompt that changed no files is listed too, its whole text under its line.
   expect((await about()).slice(-4)).toEqual(['Add a parser\nwith tests', 'took 1s · 1 command', '$ pytest', 'No file changes.'])
+  await ui.unmount()
+})
+
+test('a shell command records no edit to a file that was already changed and that it leaves alone', async ($, on) => {
+  const { disk } = fake(on, true)
+  on('session.cwd', () => ({ value: '/repo' }))
+  // Changed before the command, so git lists it either side of it.
+  disk.set('/repo/x.py', 'mine\n')
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+
+  const ui = await mount($)
+  expect(await rows(ui)).toEqual([])
   await ui.unmount()
 })
