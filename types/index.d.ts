@@ -22,8 +22,9 @@ export type Commit = { commit: string; root: string; at: number }
 // The files of the repository Claude was started in, relative to its root.
 export type Repo = { root: string; files: string[]; isGit?: boolean }
 
-// A prompt that started a turn, its first line kept.
-export type Prompt = { text: string; at: number }
+// A prompt that started a turn: its first line, the whole of it when longer, the shell commands the turn ran,
+// and once the turn ended, how long it took and whether it was interrupted.
+export type Prompt = { text: string; at: number; full?: string; commands?: string[]; ms?: number; isAborted?: boolean }
 
 export type FileFocus = { id?: string; mode: 'diff' | 'file'; isHidden?: boolean }
 

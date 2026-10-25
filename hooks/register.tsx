@@ -15,6 +15,11 @@ const WHOLE_FILE = 1_000_000_000
 const MAX_REPO_FILES = 20_000
 const MAX_PROMPTS = 200
 const MAX_PROMPT_TEXT = 300
+const MAX_PROMPT_FULL = 2000
+const MAX_COMMANDS = 50
+const MAX_COMMAND = 200
+// The commands an open prompt lists before saying how many more.
+const SHOWN_COMMANDS = 8
 // Where a prompt the person sent comes from: typed, through Remote Control, or an SDK host's turn.
 const PERSON_ORIGINS = ['composer', 'bridge', 'sdk']
 // What a Code element draws at most.
@@ -342,17 +347,39 @@ const restore = async ($: EngineInterface) => {
 
 const promptsPath = (path: string) => path.replace(/\.json$/, '.prompts.json')
 
-// Records a prompt that starts a turn, by its first line, and saves the list beside the edits.
-const notePrompt = async ($: EngineInterface, text: string, at: number) => {
-  const line = text.split('\n').map(l => l.trim()).find(Boolean) ?? ''
-  const short = line.length > MAX_PROMPT_TEXT ? `${line.slice(0, MAX_PROMPT_TEXT - 1)}…` : line
-  await update($, prompts, cur => [...cur, { text: short, at }].slice(-MAX_PROMPTS))
+const cut = (text: string, room: number) => (text.length > room ? `${text.slice(0, room - 1)}…` : text)
+
+const savePrompts = async ($: EngineInterface) => {
   try {
     const path = await savePath($)
     if (path) await $.fs.write(promptsPath(path), JSON.stringify(await read($, prompts)))
   } catch {
     // The pane works without it.
   }
+}
+
+// Records a prompt that starts a turn by its first line, and the whole of it when that is longer.
+const notePrompt = async ($: EngineInterface, text: string, at: number) => {
+  const line = cut(text.split('\n').map(l => l.trim()).find(Boolean) ?? '', MAX_PROMPT_TEXT)
+  const full = cut(text.trim(), MAX_PROMPT_FULL)
+  const prompt: Prompt = full === line ? { text: line, at } : { text: line, at, full }
+  await update($, prompts, cur => [...cur, prompt].slice(-MAX_PROMPTS))
+  await savePrompts($)
+}
+
+// Changes the latest prompt while its turn runs; a turn another prompt started (a plugin's) leaves it alone,
+// as the latest prompt's turn has then ended.
+const whileRunning = async ($: EngineInterface, change: (prompt: Prompt) => Prompt) => {
+  const last = (await read($, prompts)).at(-1)
+  if (!last || last.ms !== undefined) return
+  await update($, prompts, cur => [...cur.slice(0, -1), change(cur[cur.length - 1])])
+  await savePrompts($)
+}
+
+const duration = (ms: number) => {
+  const s = Math.round(ms / 1000)
+
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }
 
 // ---- Repository view ----
@@ -495,6 +522,15 @@ export const register: Register = on => {
   })
 
   // /sidebar opens the pane, or closes it when it is open.
+  // The main loop's turn ending closes the latest prompt's, with how long it took.
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      await whileRunning($, p => ({ ...p, ms: e.durationMs, ...(e.isAborted ? { isAborted: true } : {}) })).catch(() => {})
+    }
+
+    return next(e)
+  })
+
   on('command.run', { command: 'sidebar' }, async $ => {
     if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
       await $.ui.close({ id: PANE })
@@ -524,6 +560,8 @@ export const register: Register = on => {
     let dir = ''
     try {
       const command = String(e.input.command ?? '')
+      const line = command.split('\n').map(l => l.trim()).find(Boolean)
+      if (line) await whileRunning($, p => ({ ...p, commands: [...(p.commands ?? []), cut(line, MAX_COMMAND)].slice(-MAX_COMMANDS) }))
       const homeDir = await getHome($)
       dir = await $.session.cwd().catch(() => '')
       const cd = /^\s*cd\s+("[^"]+"|'[^']+'|\S+)\s*(&&|;)/.exec(command)
@@ -783,8 +821,9 @@ export const register: Register = on => {
     const shut = await read($, folded)
     const seen = await read($, commits)
     const armed = await read($, arming)
-    // What a group's line says, when not its label.
+    // What a group's line says, when not its label, and the prompt a prompt's group is for.
     const titles = new Map<string, string>()
+    const promptOf = new Map<string, Prompt>()
     // A prompt's or commit's line, pressed to fold its files away or back; a commit's ends in a button
     // that reverts it on a second press.
     const breakLine = (label: string, count: number) => {
@@ -852,12 +891,16 @@ export const register: Register = on => {
 
     // The rows to show: each file once, or each prompt's or commit's files under a line naming it.
     type Row = { key: string; file: string; fileEdits: FileEdit[]; bucket?: string; header?: number }
+    // A group with no files still has a row, for its line.
     const under = (labels: string[], buckets: Map<string, FileEdit[]>): Row[] =>
-      labels.flatMap(label =>
-        group(buckets.get(label)!).map(([file, fileEdits], k, all) => ({
+      labels.flatMap(label => {
+        const byFile = group(buckets.get(label)!)
+        if (byFile.length === 0) return [{ key: label, file: '', fileEdits: [], bucket: label, header: 0 }]
+
+        return byFile.map(([file, fileEdits], k, all) => ({
           key: `${label}\t${file}`, file, fileEdits, bucket: label, header: k === 0 ? all.length : undefined,
-        })),
-      )
+        }))
+      })
     let rows: Row[] = files.map(([file, fileEdits]) => ({ key: file, file, fileEdits }))
     if (by === 'commits') {
       // An edit belongs to the first commit after it in its repository; later edits are uncommitted.
@@ -875,19 +918,48 @@ export const register: Register = on => {
       })
       rows = under(labels, buckets)
     }
+    let latest: Prompt | undefined
     if (by === 'prompts') {
       // An edit belongs to the last prompt before it; edits before any seen prompt go together at the bottom.
+      // Every prompt is listed, those that changed no files too.
       const asked = await read($, prompts)
-      const buckets = new Map<string, FileEdit[]>()
+      const buckets = new Map<string, FileEdit[]>(asked.map(p => [`prompt:${p.at}`, []]))
       for (const edit of list) {
         const prompt = asked.findLast(p => p.at <= edit.at)
         const label = prompt ? `prompt:${prompt.at}` : 'earlier'
         buckets.set(label, [...(buckets.get(label) ?? []), edit])
       }
-      for (const p of asked) titles.set(`prompt:${p.at}`, `${clockTime(p.at)} ${p.text}`)
+      for (const p of asked) {
+        titles.set(`prompt:${p.at}`, `${clockTime(p.at)} ${p.text}`)
+        promptOf.set(`prompt:${p.at}`, p)
+      }
+      latest = asked.at(-1)
       titles.set('earlier', 'before the first prompt seen')
       const time = (label: string) => (label === 'earlier' ? -Infinity : Number(label.slice('prompt:'.length)))
       rows = under([...buckets.keys()].sort((a, b) => time(b) - time(a)), buckets)
+    }
+
+    // An open prompt's turn under its line: the whole prompt when longer than the line, how long the turn took,
+    // and the shell commands it ran.
+    const about = (label: string) => {
+      const p = promptOf.get(label)
+      if (!p) return null
+      const ran = p.commands ?? []
+      const status = p.ms !== undefined
+        ? `${p.isAborted ? 'interrupted after' : 'took'} ${duration(p.ms)}`
+        : p === latest ? 'running…' : ''
+      const count = ran.length > 0 ? `${ran.length} command${ran.length === 1 ? '' : 's'}` : ''
+
+      return (
+        <Box key={`about:${label}`} flexDirection="column" paddingLeft={2}>
+          {p.full !== undefined && <Text dimColor>{p.full}</Text>}
+          {(status || count) && <Text dimColor>{[status, count].filter(Boolean).join(' · ')}</Text>}
+          {ran.slice(0, SHOWN_COMMANDS).map((command, k) => (
+            <Text key={`ran:${label}:${k}`} dimColor wrap="truncate-end">{`$ ${command}`}</Text>
+          ))}
+          {ran.length > SHOWN_COMMANDS && <Text dimColor>… {ran.length - SHOWN_COMMANDS} more</Text>}
+        </Box>
+      )
     }
 
     const setFocus = (file: string, change: Partial<FileFocus>) =>
@@ -901,6 +973,15 @@ export const register: Register = on => {
         {rows.map(({ key, file, fileEdits, bucket, header }) => {
           // A folded commit shows only its line.
           if (bucket !== undefined && shut.includes(bucket)) return header !== undefined && breakLine(bucket, header)
+          if (bucket !== undefined && fileEdits.length === 0) {
+            return (
+              <Box key={`f:${key}`} flexDirection="column">
+                {breakLine(bucket, 0)}
+                {about(bucket)}
+                <Box paddingLeft={2}><Text dimColor>No file changes.</Text></Box>
+              </Box>
+            )
+          }
           const isOpen = open.includes(key)
           const added = fileEdits.reduce((n, x) => n + x.added, 0)
           const removed = fileEdits.reduce((n, x) => n + x.removed, 0)
@@ -958,6 +1039,7 @@ export const register: Register = on => {
           return (
             <Box key={`f:${key}`} flexDirection="column">
               {bucket !== undefined && header !== undefined && breakLine(bucket, header)}
+              {bucket !== undefined && header !== undefined && about(bucket)}
               <Button key={`toggle:${key}`} plain onPress={() => toggle(key)}>
                 <Text wrap="truncate-end">
                   {isOpen ? '▾' : '▸'} <Text bold={isOpen}>{path}</Text>

@@ -502,3 +502,40 @@ test('/sidebar opens the pane, closes it when open, and a closed pane stays clos
   expect(await $.command.run({ command: 'sidebar', args: '' } as never)).toEqual({ text: 'Sidebar opened.' })
   expect([...panes]).toEqual(['sidebar'])
 })
+
+test('an open prompt shows the whole prompt, how long its turn took and the commands it ran', async ($, on) => {
+  const { disk, setEffect } = fake(on, true)
+  on('turn.complete', ($: unknown, e: any) => ({ text: e.answer }))
+  disk.set('/home/me/.local/share/sidebar-for-claude/s1.prompts.json', JSON.stringify([
+    { text: 'Add a parser', at: 1, full: 'Add a parser\nwith tests', commands: ['pytest'], ms: 1000 },
+    { text: 'Fix the README', at: 2 },
+  ]))
+  await $.command.run({ command: 'sidebar', args: '' } as never)
+
+  // The running turn's commands are its prompt's, one line each.
+  setEffect(() => disk.set('/repo/README.md', 'r\n'))
+  await $.tool.call({ tool: 'Bash', input: { command: 'cd /repo && echo r > README.md' } } as never)
+  for (let k = 0; k < 9; k++) await $.tool.call({ tool: 'Bash', input: { command: `\n  ls ${k}\n  pwd` } } as never)
+
+  const ui = await mount($, 80, 'prompts')
+  const about = async () =>
+    (await ui.findAll({ type: 'Text' }))
+      .map((t: any) => t.text)
+      .filter((t: string) => !/^([▸▾] |\/| [+-]| new$)/.test(t) && t.trim() && !/^(prompts|files|commits|repo)$/.test(t))
+  expect((await about()).slice(0, 10)).toEqual([
+    'running… · 10 commands', '$ cd /repo && echo r > README.md', '$ ls 0', '$ ls 1', '$ ls 2', '$ ls 3', '$ ls 4', '$ ls 5', '$ ls 6', '… 2 more',
+  ])
+
+  // Its end closes it; a later turn another prompt started (a plugin's) leaves it alone.
+  await $.turn.complete({ answer: 'Done.', durationMs: 125_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await $.turn.complete({ answer: 'Why.', durationMs: 5_000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await $.tool.call({ tool: 'Bash', input: { command: 'git status' } } as never)
+  const saved = JSON.parse(disk.get('/home/me/.local/share/sidebar-for-claude/s1.prompts.json')!)
+  expect(saved[1].ms).toBe(125_000)
+  expect(saved[1].commands.length).toBe(10)
+  expect((await about())[0]).toBe('took 2m 5s · 10 commands')
+
+  // A prompt that changed no files is listed too, its whole text under its line.
+  expect((await about()).slice(-4)).toEqual(['Add a parser\nwith tests', 'took 1s · 1 command', '$ pytest', 'No file changes.'])
+  await ui.unmount()
+})
