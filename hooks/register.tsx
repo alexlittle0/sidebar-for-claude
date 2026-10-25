@@ -988,11 +988,13 @@ export const register: Register = on => {
           const latest = fileEdits[fileEdits.length - 1]
           const tag = latest.isDeleted ? ' deleted' : fileEdits[0].isNew ? ' new' : ''
 
+          // A file under a prompt's or commit's line sits inset beneath it.
+          const inset = bucket !== undefined ? 2 : 0
           // Extras are dropped, least important first, until the file name fits on one line.
           const name = file.split('/').pop()!
           const stats = ` +${added} -${removed}`
           const count = fileEdits.length > 1 ? ` (${fileEdits.length} edits)` : ''
-          let room = columns - 2 - name.length
+          let room = columns - inset - 2 - name.length
           const showStats = stats.length <= room
           if (showStats) room -= stats.length
           const showTag = showStats && tag.length <= room
@@ -1040,68 +1042,70 @@ export const register: Register = on => {
             <Box key={`f:${key}`} flexDirection="column">
               {bucket !== undefined && header !== undefined && breakLine(bucket, header)}
               {bucket !== undefined && header !== undefined && about(bucket)}
-              <Button key={`toggle:${key}`} plain onPress={() => toggle(key)}>
-                <Text wrap="truncate-end">
-                  {isOpen ? '▾' : '▸'} <Text bold={isOpen}>{path}</Text>
-                  {showStats && <Text color="success"> +{added}</Text>}
-                  {showStats && <Text color="error"> -{removed}</Text>}
-                  {showTag && <Text color={latest.isDeleted ? 'error' : 'suggestion'}>{tag}</Text>}
-                  {showCount && <Text dimColor>{count}</Text>}
-                </Text>
-              </Button>
-              {isOpen && (
-                <Box flexDirection="column" paddingLeft={2}>
-                  {/* Newest first, as everything in the pane is. */}
-                  {[...fileEdits.entries()].reverse().map(([k, one]) => (
-                    <Button key={`rec:${one.id}`} plain onPress={() => pick(k)}>
-                      <Text wrap="truncate-end" bold={k === idx} dimColor={k !== idx}>
-                        {k === idx ? '●' : '○'} #{number.get(one.id)} {clockTime(one.at)} {TOOL_LABEL[one.tool]}
-                        <Text color="success"> +{one.added}</Text>
-                        <Text color="error"> -{one.removed}</Text>
-                        {one.isDeleted && <Text color="error"> deleted</Text>}
-                      </Text>
-                    </Button>
-                  ))}
-                  <Box flexWrap="nowrap">
-                    <Button key={`fold:${key}`} plain onPress={() => setFocus(key, { isHidden: !isHidden })}>
-                      <Text dimColor>{isHidden ? '▸ show' : '▾ hide'}</Text>
-                    </Button>
-                    <Text dimColor> │ </Text>
-                    {idx > 0 ? <Button key={`older:${key}`} label="◀" plain onPress={() => pick(idx - 1)} /> : <Text dimColor>◀</Text>}
-                    <Text> </Text>
-                    {!isLatest ? <Button key={`newer:${key}`} label="▶" plain onPress={() => pick(idx + 1)} /> : <Text dimColor>▶</Text>}
-                    <Text> </Text>
-                    {!isLatest ? (
-                      <Button key={`latest:${key}`} label="latest" plain onPress={() => pick(fileEdits.length - 1)} />
-                    ) : (
-                      <Text dimColor>latest</Text>
-                    )}
-                    <Text dimColor> │ </Text>
-                    <Button key={`diff:${key}`} plain onPress={() => setFocus(key, { mode: 'diff', isHidden: false })}>
-                      <Text bold={mode === 'diff'} dimColor={mode !== 'diff'} underline={mode === 'diff'}>diff</Text>
-                    </Button>
-                    <Text> </Text>
-                    <Button key={`file:${key}`} plain onPress={() => setFocus(key, { mode: 'file', isHidden: false })}>
-                      <Text bold={mode === 'file'} dimColor={mode !== 'file'} underline={mode === 'file'}>file</Text>
-                    </Button>
-                  </Box>
-                  <Box flexWrap="nowrap">
-                    <Button key={`why:${key}`} plain onPress={why}>
-                      <Text color="suggestion">why?</Text>
-                    </Button>
-                    {!latest.isDeleted && <Text dimColor> │ </Text>}
-                    {!latest.isDeleted && (
-                      <Button key={`nvim:${key}`} plain onPress={() => openInNvim($, file, firstChange(edit.hunks))}>
-                        <Text color="suggestion">open in nvim</Text>
+              <Box flexDirection="column" paddingLeft={inset}>
+                <Button key={`toggle:${key}`} plain onPress={() => toggle(key)}>
+                  <Text wrap="truncate-end">
+                    {isOpen ? '▾' : '▸'} <Text bold={isOpen}>{path}</Text>
+                    {showStats && <Text color="success"> +{added}</Text>}
+                    {showStats && <Text color="error"> -{removed}</Text>}
+                    {showTag && <Text color={latest.isDeleted ? 'error' : 'suggestion'}>{tag}</Text>}
+                    {showCount && <Text dimColor>{count}</Text>}
+                  </Text>
+                </Button>
+                {isOpen && (
+                  <Box flexDirection="column" paddingLeft={2}>
+                    {/* Newest first, as everything in the pane is. */}
+                    {[...fileEdits.entries()].reverse().map(([k, one]) => (
+                      <Button key={`rec:${one.id}`} plain onPress={() => pick(k)}>
+                        <Text wrap="truncate-end" bold={k === idx} dimColor={k !== idx}>
+                          {k === idx ? '●' : '○'} #{number.get(one.id)} {clockTime(one.at)} {TOOL_LABEL[one.tool]}
+                          <Text color="success"> +{one.added}</Text>
+                          <Text color="error"> -{one.removed}</Text>
+                          {one.isDeleted && <Text color="error"> deleted</Text>}
+                        </Text>
                       </Button>
+                    ))}
+                    <Box flexWrap="nowrap">
+                      <Button key={`fold:${key}`} plain onPress={() => setFocus(key, { isHidden: !isHidden })}>
+                        <Text dimColor>{isHidden ? '▸ show' : '▾ hide'}</Text>
+                      </Button>
+                      <Text dimColor> │ </Text>
+                      {idx > 0 ? <Button key={`older:${key}`} label="◀" plain onPress={() => pick(idx - 1)} /> : <Text dimColor>◀</Text>}
+                      <Text> </Text>
+                      {!isLatest ? <Button key={`newer:${key}`} label="▶" plain onPress={() => pick(idx + 1)} /> : <Text dimColor>▶</Text>}
+                      <Text> </Text>
+                      {!isLatest ? (
+                        <Button key={`latest:${key}`} label="latest" plain onPress={() => pick(fileEdits.length - 1)} />
+                      ) : (
+                        <Text dimColor>latest</Text>
+                      )}
+                      <Text dimColor> │ </Text>
+                      <Button key={`diff:${key}`} plain onPress={() => setFocus(key, { mode: 'diff', isHidden: false })}>
+                        <Text bold={mode === 'diff'} dimColor={mode !== 'diff'} underline={mode === 'diff'}>diff</Text>
+                      </Button>
+                      <Text> </Text>
+                      <Button key={`file:${key}`} plain onPress={() => setFocus(key, { mode: 'file', isHidden: false })}>
+                        <Text bold={mode === 'file'} dimColor={mode !== 'file'} underline={mode === 'file'}>file</Text>
+                      </Button>
+                    </Box>
+                    <Box flexWrap="nowrap">
+                      <Button key={`why:${key}`} plain onPress={why}>
+                        <Text color="suggestion">why?</Text>
+                      </Button>
+                      {!latest.isDeleted && <Text dimColor> │ </Text>}
+                      {!latest.isDeleted && (
+                        <Button key={`nvim:${key}`} plain onPress={() => openInNvim($, file, firstChange(edit.hunks))}>
+                          <Text color="suggestion">open in nvim</Text>
+                        </Button>
+                      )}
+                    </Box>
+                    {!isHidden && view}
+                    {!isHidden && mode === 'diff' && edit.hunks.reduce((n, h) => n + h.lines.length, 0) >= MAX_DIFF_LINES && (
+                      <Text dimColor>… diff cut at {MAX_DIFF_LINES} lines</Text>
                     )}
                   </Box>
-                  {!isHidden && view}
-                  {!isHidden && mode === 'diff' && edit.hunks.reduce((n, h) => n + h.lines.length, 0) >= MAX_DIFF_LINES && (
-                    <Text dimColor>… diff cut at {MAX_DIFF_LINES} lines</Text>
-                  )}
-                </Box>
-              )}
+                )}
+              </Box>
             </Box>
           )
         })}

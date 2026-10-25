@@ -480,6 +480,16 @@ test('the prompts tab groups each prompt\'s files under it, newest first', async
     '▾ T Add a parser', '/repo/test_parse.py', '/repo/parse.py',
     '▾ before the first prompt seen', '/repo/old.py',
   ])
+  // A prompt's files sit inset under its line.
+  const insets = async () =>
+    (await ui.findAll({ type: 'Box' }))
+      .filter((b: any) => /^▸ \/repo\/README.md/.test(b.text ?? ''))
+      .map((b: any) => b.props.paddingLeft ?? 0)
+  expect(await insets()).toContain(2)
+  await ui.press({ key: 'view:files' })
+  expect(await insets()).not.toContain(2)
+  await ui.press({ key: 'view:prompts' })
+
   await ui.press({ key: 'commit:prompt:1002000' })
   expect(await lines()).toEqual([
     '▾ T Fix the README', '/repo/README.md', '▸ T Add a parser (2 files)', '▾ before the first prompt seen', '/repo/old.py',
