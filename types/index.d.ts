@@ -22,13 +22,16 @@ export type Commit = { commit: string; root: string; at: number }
 // The files of the repository Claude was started in, relative to its root.
 export type Repo = { root: string; files: string[]; isGit?: boolean }
 
+// A prompt that started a turn, its first line kept.
+export type Prompt = { text: string; at: number }
+
 export type FileFocus = { id?: string; mode: 'diff' | 'file'; isHidden?: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
     'sidebar-for-claude': {
-      edits: FileEdit[]; expanded: string[]; focus: Record<string, FileFocus>; commits: Commit[]; view: 'files' | 'commits' | 'repo'; folded: string[]
-      repo: Repo; openDirs: string[]; viewing: string; viewingDiff: boolean; arming: string
+      edits: FileEdit[]; expanded: string[]; focus: Record<string, FileFocus>; commits: Commit[]; view: 'prompts' | 'files' | 'commits' | 'repo'; folded: string[]
+      repo: Repo; openDirs: string[]; viewing: string; viewingDiff: boolean; arming: string; prompts: Prompt[]; isClosed: boolean
     }
   }
 }

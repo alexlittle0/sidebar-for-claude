@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Commit, FileEdit, FileFocus, Hunk, Repo } from '../types'
+import type { Commit, FileEdit, FileFocus, Hunk, Prompt, Repo } from '../types'
 
 const PANE = 'sidebar'
 const MAX_EDITS = 200
@@ -13,6 +13,10 @@ const MAX_SNAPSHOT = 100_000
 const MAX_SAVED = 3_500_000
 const WHOLE_FILE = 1_000_000_000
 const MAX_REPO_FILES = 20_000
+const MAX_PROMPTS = 200
+const MAX_PROMPT_TEXT = 300
+// Where a prompt the person sent comes from: typed, through Remote Control, or an SDK host's turn.
+const PERSON_ORIGINS = ['composer', 'bridge', 'sdk']
 // What a Code element draws at most.
 const MAX_SHOWN = 100_000
 // Folders a listing outside git skips.
@@ -23,8 +27,12 @@ const edits = atom({ plugin: 'sidebar-for-claude', key: 'edits' } as const, [])
 const expanded = atom({ plugin: 'sidebar-for-claude', key: 'expanded' } as const, [])
 const focus = atom({ plugin: 'sidebar-for-claude', key: 'focus' } as const, {} as Record<string, FileFocus>)
 const commits = atom({ plugin: 'sidebar-for-claude', key: 'commits' } as const, [] as Commit[])
-// The pane lists each file once, the files of each commit, or the whole repository.
-const view = atom({ plugin: 'sidebar-for-claude', key: 'view' } as const, 'files' as 'files' | 'commits' | 'repo')
+// The pane lists the files of each prompt, each file once, the files of each commit, or the whole repository.
+const view = atom({ plugin: 'sidebar-for-claude', key: 'view' } as const, 'prompts' as 'prompts' | 'files' | 'commits' | 'repo')
+// The prompts that started each turn, oldest first.
+const prompts = atom({ plugin: 'sidebar-for-claude', key: 'prompts' } as const, [] as Prompt[])
+// Whether the pane was closed, by /sidebar or by hand, so a reload leaves it closed.
+const isClosed = atom({ plugin: 'sidebar-for-claude', key: 'isClosed' } as const, false)
 // The commits folded away in the commits view.
 const folded = atom({ plugin: 'sidebar-for-claude', key: 'folded' } as const, [] as string[])
 const repo = atom({ plugin: 'sidebar-for-claude', key: 'repo' } as const, { root: '', files: [] } as Repo)
@@ -300,7 +308,6 @@ const record = async (
   }
 }
 
-// Puts the saved edits back when the pane's history is empty.
 // Checks each folder holding tracked files once.
 const checkCommits = async ($: EngineInterface) => {
   const folders = new Map<string, string>()
@@ -308,17 +315,43 @@ const checkCommits = async ($: EngineInterface) => {
   for (const file of folders.values()) await checkCommit($, file)
 }
 
+// Puts the saved edits and prompts back when the pane's history of them is empty.
 const restore = async ($: EngineInterface) => {
-  if ((await read($, edits)).length > 0) return
+  const path = await savePath($)
+  if (!path) return
+  const load = async (file: string) => {
+    try {
+      const saved = (await $.fs.exists(file)) ? JSON.parse(await $.fs.read(file)) : []
+
+      return Array.isArray(saved) ? saved : []
+    } catch {
+      return []
+    }
+  }
+  if ((await read($, edits)).length === 0) {
+    const saved = await load(path)
+    if (saved.length > 0) await update($, edits, cur => (cur.length > 0 ? cur : saved.slice(-MAX_EDITS)))
+  }
+  if ((await read($, prompts)).length === 0) {
+    const saved = await load(promptsPath(path))
+    if (saved.length > 0) await update($, prompts, cur => (cur.length > 0 ? cur : saved.slice(-MAX_PROMPTS)))
+  }
+}
+
+// ---- Prompts ----
+
+const promptsPath = (path: string) => path.replace(/\.json$/, '.prompts.json')
+
+// Records a prompt that starts a turn, by its first line, and saves the list beside the edits.
+const notePrompt = async ($: EngineInterface, text: string, at: number) => {
+  const line = text.split('\n').map(l => l.trim()).find(Boolean) ?? ''
+  const short = line.length > MAX_PROMPT_TEXT ? `${line.slice(0, MAX_PROMPT_TEXT - 1)}…` : line
+  await update($, prompts, cur => [...cur, { text: short, at }].slice(-MAX_PROMPTS))
   try {
     const path = await savePath($)
-    if (!path || !(await $.fs.exists(path))) return
-    const saved = JSON.parse(await $.fs.read(path))
-    if (Array.isArray(saved) && saved.length > 0) {
-      await update($, edits, cur => (cur.length > 0 ? cur : saved.slice(-MAX_EDITS)))
-    }
+    if (path) await $.fs.write(promptsPath(path), JSON.stringify(await read($, prompts)))
   } catch {
-    // Nothing to restore.
+    // The pane works without it.
   }
 }
 
@@ -444,18 +477,42 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await restore($)
     await checkCommits($).catch(() => {})
-    await $.command.register({ name: 'sidebar', description: 'Show the sidebar: files Claude edited, by file or commit, and the whole repository' })
-    void $.ui.open({ id: PANE, title: 'Sidebar' })
+    await $.command.register({ name: 'sidebar', description: 'Show or hide the sidebar: files Claude edited, by prompt, file or commit, and the whole repository' })
+    if (!(await read($, isClosed))) void $.ui.open({ id: PANE, title: 'Sidebar' })
 
     return next(e)
   })
 
+  // Edits group under the prompt the person sent that started their turn. A message delivered into a running turn
+  // starts none, nor does anything else that starts a turn (a plugin's prompt, a background task's notification).
+  on('prompt.submit', async ($, e, next) => {
+    const at = await $.clock.now().catch(() => Date.now())
+    const ran = await next(e)
+    const isPerson = PERSON_ORIGINS.includes(e.origin.kind) && e.isMeta !== true
+    if (ran.drop === undefined && e.turnId === undefined && isPerson) await notePrompt($, ran.text ?? e.text, at).catch(() => {})
+
+    return ran
+  })
+
+  // /sidebar opens the pane, or closes it when it is open.
   on('command.run', { command: 'sidebar' }, async $ => {
+    if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
+      await $.ui.close({ id: PANE })
+
+      return { text: 'Sidebar closed.' }
+    }
     await restore($)
     await checkCommits($).catch(() => {})
+    await update($, isClosed, () => false)
     await $.ui.open({ id: PANE, title: 'Sidebar' })
 
     return { text: 'Sidebar opened.' }
+  })
+
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PANE && e.origin.kind !== 'unload') await update($, isClosed, () => true)
+
+    return next(e)
   })
 
   // Bash can change files too (sed, scripts, mv): snapshot the files it might touch, compare after.
@@ -562,7 +619,7 @@ export const register: Register = on => {
     // One column spare so a row never touches the edge and wraps.
     const columns = Math.max(4, (e.props.bodyColumns ?? 40) - 1)
 
-    const tab = (name: 'files' | 'commits' | 'repo') => (
+    const tab = (name: 'prompts' | 'files' | 'commits' | 'repo') => (
       <Button
         key={`view:${name}`}
         plain
@@ -576,6 +633,8 @@ export const register: Register = on => {
     )
     const tabs = (
       <Box flexWrap="nowrap">
+        {tab('prompts')}
+        <Text> </Text>
         {tab('files')}
         <Text> </Text>
         {tab('commits')}
@@ -724,9 +783,12 @@ export const register: Register = on => {
     const shut = await read($, folded)
     const seen = await read($, commits)
     const armed = await read($, arming)
-    // A commit's line, pressed to fold its files away or back, ending in a button that reverts the commit
-    // on a second press.
+    // What a group's line says, when not its label.
+    const titles = new Map<string, string>()
+    // A prompt's or commit's line, pressed to fold its files away or back; a commit's ends in a button
+    // that reverts it on a second press.
     const breakLine = (label: string, count: number) => {
+      const title = titles.get(label) ?? label
       const isShut = shut.includes(label)
       const files = isShut ? ` (${count} file${count === 1 ? '' : 's'})` : ''
       const found = seen.find(c => c.commit === label)
@@ -736,7 +798,8 @@ export const register: Register = on => {
       const room = columns - 4 - files.length - wanted.length
       const commit = found !== undefined && room >= label.split(' ')[0].length + 1 ? found : undefined
       const action = commit === undefined ? '' : wanted
-      const name = commit !== undefined && label.length > room ? `${label.slice(0, room - 1).trimEnd()}…` : label
+      const fits = columns - 4 - files.length - action.length
+      const name = title.length > fits ? `${title.slice(0, Math.max(1, fits - 1)).trimEnd()}…` : title
       const text = `${isShut ? '▸' : '▾'} ${name}${files}`
 
       return (
@@ -787,8 +850,14 @@ export const register: Register = on => {
       })
     }
 
-    // The rows to show: each file once, or each commit's files under a line naming it.
+    // The rows to show: each file once, or each prompt's or commit's files under a line naming it.
     type Row = { key: string; file: string; fileEdits: FileEdit[]; bucket?: string; header?: number }
+    const under = (labels: string[], buckets: Map<string, FileEdit[]>): Row[] =>
+      labels.flatMap(label =>
+        group(buckets.get(label)!).map(([file, fileEdits], k, all) => ({
+          key: `${label}\t${file}`, file, fileEdits, bucket: label, header: k === 0 ? all.length : undefined,
+        })),
+      )
     let rows: Row[] = files.map(([file, fileEdits]) => ({ key: file, file, fileEdits }))
     if (by === 'commits') {
       // An edit belongs to the first commit after it in its repository; later edits are uncommitted.
@@ -804,11 +873,21 @@ export const register: Register = on => {
 
         return time(b) - time(a)
       })
-      rows = labels.flatMap(label =>
-        group(buckets.get(label)!).map(([file, fileEdits], k, all) => ({
-          key: `${label}\t${file}`, file, fileEdits, bucket: label, header: k === 0 ? all.length : undefined,
-        })),
-      )
+      rows = under(labels, buckets)
+    }
+    if (by === 'prompts') {
+      // An edit belongs to the last prompt before it; edits before any seen prompt go together at the bottom.
+      const asked = await read($, prompts)
+      const buckets = new Map<string, FileEdit[]>()
+      for (const edit of list) {
+        const prompt = asked.findLast(p => p.at <= edit.at)
+        const label = prompt ? `prompt:${prompt.at}` : 'earlier'
+        buckets.set(label, [...(buckets.get(label) ?? []), edit])
+      }
+      for (const p of asked) titles.set(`prompt:${p.at}`, `${clockTime(p.at)} ${p.text}`)
+      titles.set('earlier', 'before the first prompt seen')
+      const time = (label: string) => (label === 'earlier' ? -Infinity : Number(label.slice('prompt:'.length)))
+      rows = under([...buckets.keys()].sort((a, b) => time(b) - time(a)), buckets)
     }
 
     const setFocus = (file: string, change: Partial<FileFocus>) =>

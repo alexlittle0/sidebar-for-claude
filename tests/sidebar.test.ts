@@ -40,7 +40,19 @@ const fake = (on: any, isRepo: boolean) => {
     return { value: undefined }
   })
   on('session.id', () => ({ value: 's1' }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  // The panes open, as the engine lists them.
+  const panes = new Set<string>()
+  on('ui.open', ($: unknown, e: any) => {
+    panes.add(e.id)
+
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', ($: unknown, e: any) => {
+    panes.delete(e.id)
+
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({ value: [...panes].map(id => ({ id, title: 'Sidebar', isShown: true, isFocused: false, isPlaced: true })) }))
   on('process.run', ($: unknown, e: any) => {
     if (e.argv[0] === 'printenv') return done(0, '/home/me\n')
     if (!isRepo) return done(128)
@@ -86,11 +98,16 @@ const fake = (on: any, isRepo: boolean) => {
       return { result: result ?? { stdout: '', stderr: '', interrupted: false } }
     })
   }
-  return { disk, repo, opened, lines, setEffect: (change: () => unknown) => (effect = change as () => void) }
+  return { disk, repo, opened, lines, panes, setEffect: (change: () => unknown) => (effect = change as () => void) }
 }
 
-const mount = async ($: any, bodyColumns = 80) =>
-  $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns } } as never)
+// The pane, on the files view unless another is named.
+const mount = async ($: any, bodyColumns = 80, view = 'files') => {
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns } } as never)
+  await ui.press({ key: `view:${view}` })
+
+  return ui
+}
 
 const rows = async (ui: any) =>
   (await ui.findAll({ type: 'Button' })).filter((b: any) => /^toggle:/.test(b.key)).map((b: any) => b.text)
@@ -420,4 +437,68 @@ test('a commit is reverted on a second press, in a new commit holding the files 
   expect(records.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['● #2 T revert +1 -1'])
   expect((await ui.find({ type: 'Code' }))?.props.source).toBe('@@ -1,1 +1,1 @@\n-b\n+a')
   await ui.unmount()
+})
+
+test('the prompts tab groups each prompt\'s files under it, newest first', async ($, on) => {
+  const { disk, setEffect } = fake(on, true)
+  let now = 1_000_000
+  on('clock.now', () => ({ value: now }))
+  on('prompt.submit', ($: unknown, e: any) => ({ text: e.text }))
+  const edit = async (file: string, text: string) => {
+    now += 1000
+    setEffect(() => {
+      disk.set(file, text)
+
+      return { type: 'create', filePath: file, content: text, structuredPatch: [], originalFile: null }
+    })
+    await $.tool.call({ tool: 'Write', input: { file_path: file, content: text } } as never)
+  }
+  // Prompts typed at the terminal, as saved: a test can raise only a plugin's.
+  disk.set('/home/me/.local/share/sidebar-for-claude/s1.prompts.json', JSON.stringify([
+    { text: 'Add a parser', at: 1_002_000 },
+    { text: 'Fix the README', at: 1_005_000 },
+  ]))
+
+  await edit('/repo/old.py', 'x\n')
+  now += 1000
+  await edit('/repo/parse.py', 'p\n')
+  await edit('/repo/test_parse.py', 't\n')
+  now += 1000
+  // A plugin's prompt (the why? button's) starts no group of its own.
+  await $.prompt.submit({ text: 'Why did you make edit #1 to /repo/parse.py?' } as never)
+  await edit('/repo/README.md', 'r\n')
+  await $.command.run({ command: 'sidebar', args: '' } as never)
+
+  const ui = await mount($, 80, 'prompts')
+  const lines = async () =>
+    (await ui.findAll({ type: 'Text' }))
+      .map((t: any) => t.text)
+      .filter((t: string) => /^[▸▾] /.test(t))
+      .map((t: string) => (/─$/.test(t) ? t.replace(/ ─+$/, '').replace(/\d\d:\d\d:\d\d/, 'T') : t.split(' ')[1]))
+  expect(await lines()).toEqual([
+    '▾ T Fix the README', '/repo/README.md',
+    '▾ T Add a parser', '/repo/test_parse.py', '/repo/parse.py',
+    '▾ before the first prompt seen', '/repo/old.py',
+  ])
+  await ui.press({ key: 'commit:prompt:1002000' })
+  expect(await lines()).toEqual([
+    '▾ T Fix the README', '/repo/README.md', '▸ T Add a parser (2 files)', '▾ before the first prompt seen', '/repo/old.py',
+  ])
+  // No revert on a prompt's line.
+  expect((await ui.findAll({ type: 'Button' })).filter((b: any) => /^revert:/.test(b.key))).toEqual([])
+  await ui.unmount()
+})
+
+test('/sidebar opens the pane, closes it when open, and a closed pane stays closed', async ($, on) => {
+  const { panes } = fake(on, false)
+  on('command.register', () => ({ value: undefined }))
+  on('session.start', ($: unknown, e: any) => e)
+  await $.session.start({ cwd: '/home/me' } as never)
+  expect([...panes]).toEqual(['sidebar'])
+  expect(await $.command.run({ command: 'sidebar', args: '' } as never)).toEqual({ text: 'Sidebar closed.' })
+  expect([...panes]).toEqual([])
+  await $.session.start({ cwd: '/home/me' } as never)
+  expect([...panes]).toEqual([])
+  expect(await $.command.run({ command: 'sidebar', args: '' } as never)).toEqual({ text: 'Sidebar opened.' })
+  expect([...panes]).toEqual(['sidebar'])
 })
