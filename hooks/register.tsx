@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Commit, FileEdit, FileFocus, Hunk } from '../types'
+import type { Commit, FileEdit, FileFocus, Hunk, Repo } from '../types'
 
-const PANE = 'edits'
+const PANE = 'sidebar'
 const MAX_EDITS = 200
 const MAX_DIFF_LINES = 400
 const MAX_FILE = 1_000_000
@@ -12,16 +12,29 @@ const SNAPSHOTS_PER_FILE = 20
 const MAX_SNAPSHOT = 100_000
 const MAX_SAVED = 3_500_000
 const WHOLE_FILE = 1_000_000_000
-const TOOL_LABEL = { Edit: 'edit', Write: 'write', Bash: 'shell' }
+const MAX_REPO_FILES = 20_000
+// What a Code element draws at most.
+const MAX_SHOWN = 100_000
+// Folders a listing outside git skips.
+const SKIPPED = ['.git', 'node_modules', '__pycache__', '.venv', 'venv', '.cache', 'dist', 'build', 'target']
+const TOOL_LABEL = { Edit: 'edit', Write: 'write', Bash: 'shell', Revert: 'revert' }
 
-const edits = atom({ plugin: 'edit-tracker-for-claude', key: 'edits' } as const, [])
-const expanded = atom({ plugin: 'edit-tracker-for-claude', key: 'expanded' } as const, [])
-const focus = atom({ plugin: 'edit-tracker-for-claude', key: 'focus' } as const, {} as Record<string, FileFocus>)
-const commits = atom({ plugin: 'edit-tracker-for-claude', key: 'commits' } as const, [] as Commit[])
-// The pane lists each file once, or the files of each commit.
-const view = atom({ plugin: 'edit-tracker-for-claude', key: 'view' } as const, 'files' as 'files' | 'commits')
+const edits = atom({ plugin: 'sidebar-for-claude', key: 'edits' } as const, [])
+const expanded = atom({ plugin: 'sidebar-for-claude', key: 'expanded' } as const, [])
+const focus = atom({ plugin: 'sidebar-for-claude', key: 'focus' } as const, {} as Record<string, FileFocus>)
+const commits = atom({ plugin: 'sidebar-for-claude', key: 'commits' } as const, [] as Commit[])
+// The pane lists each file once, the files of each commit, or the whole repository.
+const view = atom({ plugin: 'sidebar-for-claude', key: 'view' } as const, 'files' as 'files' | 'commits' | 'repo')
 // The commits folded away in the commits view.
-const folded = atom({ plugin: 'edit-tracker-for-claude', key: 'folded' } as const, [] as string[])
+const folded = atom({ plugin: 'sidebar-for-claude', key: 'folded' } as const, [] as string[])
+const repo = atom({ plugin: 'sidebar-for-claude', key: 'repo' } as const, { root: '', files: [] } as Repo)
+// The repository view's open folders, and the file shown in it ('' for none), relative to the root.
+const openDirs = atom({ plugin: 'sidebar-for-claude', key: 'openDirs' } as const, [] as string[])
+const viewing = atom({ plugin: 'sidebar-for-claude', key: 'viewing' } as const, '')
+// Whether the repository view shows the file or its changes since the last commit.
+const viewingDiff = atom({ plugin: 'sidebar-for-claude', key: 'viewingDiff' } as const, false)
+// The commit whose revert button was pressed once and now asks to be pressed again ('' for none).
+const arming = atom({ plugin: 'sidebar-for-claude', key: 'arming' } as const, '')
 
 // A text's lines; a final newline ends the last line rather than starting another.
 const toLines = (text: string) => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
@@ -231,13 +244,14 @@ const savePath = async ($: EngineInterface) => {
   const id = await $.session.id().catch(() => '')
   const dir = await getHome($)
 
-  return dir && id ? `${dir}/.local/share/edit-tracker-for-claude/${id}.json` : ''
+  return dir && id ? `${dir}/.local/share/sidebar-for-claude/${id}.json` : ''
 }
 
 // Records one change to a file: its diff, line counts and (while small) the whole file before and after.
+// It is timed now unless `change.at` says when.
 const record = async (
   $: EngineInterface,
-  change: { id: string; tool: FileEdit['tool']; file: string; isNew: boolean; isDeleted?: boolean },
+  change: { id: string; tool: FileEdit['tool']; file: string; isNew: boolean; isDeleted?: boolean; at?: number },
   before: string | null,
   after: string | null,
   fallback: Hunk[] = [],
@@ -245,7 +259,7 @@ const record = async (
   // A commit made since the last check lands before this edit.
   await checkCommit($, change.file)
   const all = before !== null && after !== null ? diffTexts(before, after) : fallback
-  const edit: FileEdit = { ...change, added: 0, removed: 0, hunks: [], at: await $.clock.now().catch(() => Date.now()) }
+  const edit: FileEdit = { ...change, added: 0, removed: 0, hunks: [], at: change.at ?? (await $.clock.now().catch(() => Date.now())) }
   let kept = 0
   for (const hunk of all) {
     edit.added += hunk.lines.filter(l => l[0] === '+').length
@@ -308,25 +322,140 @@ const restore = async ($: EngineInterface) => {
   }
 }
 
+// ---- Repository view ----
+
+// Lists the files of the repository Claude was started in: git's own list (ignored files left out), else every file.
+const scan = async ($: EngineInterface) => {
+  try {
+    const cwd = await $.session.cwd()
+    if (!cwd) return
+    const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd }).catch(() => null)
+    const isGit = top?.exitCode === 0
+    const root = isGit ? top.stdout.trim() : cwd
+    const skip = SKIPPED.map(name => `-name '${name}'`).join(' -o ')
+    const listing = isGit
+      ? await $.process.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: root })
+      : await $.process.run(['sh', '-c', `find . -type d \\( ${skip} \\) -prune -o -type f -print0 | head -z -n ${MAX_REPO_FILES}`], { cwd: root })
+    if (listing.exitCode !== 0) return
+    const files = [...new Set(listing.stdout.split('\0').filter(Boolean).map(f => f.replace(/^\.\//, '')))]
+      .slice(0, MAX_REPO_FILES)
+      .sort()
+    const was = await read($, repo)
+    if (was.root === root && was.isGit === isGit && was.files.join('\0') === files.join('\0')) return
+    await update($, repo, () => ({ root, files, isGit }))
+  } catch {
+    // No folder to list.
+  }
+}
+
+// Opens `$1` at line `$2` in the running nvim whose folder holds it most closely, bringing its tmux pane forward;
+// with none, in a new tmux pane, else a new kitty window. Prints where.
+const OPEN_IN_NVIM = `
+f="$1"; line="\${2:-1}"; run="\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; best=""; bestlen=-1
+for s in "$run"/nvim.*.0; do
+  [ -S "$s" ] || continue
+  pid=\${s##*/nvim.}; pid=\${pid%.0}
+  cwd=$(readlink "/proc/$pid/cwd") || continue
+  case "$f" in "$cwd"/*) len=\${#cwd} ;; *) len=0 ;; esac
+  if [ "$len" -gt "$bestlen" ]; then best=$s; bestpid=$pid; bestlen=$len; fi
+done
+if [ -n "$best" ]; then
+  # :edit, not --remote, which adds the file to the argument list and makes :q say "E173: 1 more file to edit".
+  quoted=$(printf '%s' "$f" | sed "s/'/''/g")
+  nvim --server "$best" --remote-expr "execute('edit +$line ' . fnameescape('$quoted'))" >/dev/null || exit 1
+  if [ -n "$TMUX" ]; then
+    panes=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}')
+    p=$bestpid
+    for i in 1 2 3 4 5 6 7 8; do
+      pane=$(printf '%s\\n' "$panes" | awk -v p="$p" '$1 == p { print $2 }')
+      if [ -n "$pane" ]; then tmux select-window -t "$pane"; tmux select-pane -t "$pane"; break; fi
+      p=$(awk '{ print $4 }' "/proc/$p/stat" 2>/dev/null)
+      [ "\${p:-0}" -gt 1 ] || break
+    done
+  fi
+  echo "the running nvim"; exit 0
+fi
+if [ -n "$TMUX" ]; then tmux split-window -h nvim "+$line" "$f" && echo "a new tmux pane" && exit 0; fi
+setsid -f kitty nvim "+$line" "$f" >/dev/null 2>&1 && echo "a new kitty window"
+`
+
+const openInNvim = async ($: EngineInterface, file: string, line = 1) => {
+  const ran = await $.process.run(['sh', '-c', OPEN_IN_NVIM, 'sh', file, String(line)]).catch(() => null)
+  const where = ran?.exitCode === 0 ? ran.stdout.trim() : ''
+  $.ui.toast(where ? `Opened ${shortPath(file)} in ${where}` : `Couldn't open ${shortPath(file)} in nvim`)
+}
+
+// The first changed line of an edit in the file after it, 1 when it has no hunks.
+const firstChange = (hunks: Hunk[]) => {
+  if (hunks.length === 0) return 1
+  const lead = hunks[0].lines.findIndex(l => l[0] !== ' ')
+
+  return Math.max(1, hunks[0].newStart + Math.max(0, lead))
+}
+
+// ---- Reverting commits ----
+
+// Undoes a commit with a new commit of its own, recording the files it puts back as edits timed by that commit,
+// so they sit under it in the commits view. `known` is the hooks' last known text of each file.
+const revertCommit = async ($: EngineInterface, known: Map<string, string>, commit: Commit) => {
+  const hash = commit.commit.split(' ')[0]
+  const git = (...args: string[]) => $.process.run(['git', ...args], { cwd: commit.root }).catch(() => null)
+  const ran = await git('revert', '--no-edit', hash)
+  if (ran?.exitCode !== 0) {
+    // A conflict leaves the revert half done; put the repository back as it was.
+    await git('revert', '--abort')
+    const why = `${ran?.stderr ?? ''}\n${ran?.stdout ?? ''}`.split('\n').find(l => l.trim()) ?? ''
+    $.ui.toast(`Couldn't revert ${hash}${why ? `: ${why.replace(/^(error|fatal): /, '')}` : ''}`)
+
+    return
+  }
+
+  const head = await git('log', '-1', '--format=%h%x00%ct')
+  const [made, time] = (head?.stdout ?? '').trim().split('\0')
+  const changed = await git('diff', '--name-only', '-z', 'HEAD~1', 'HEAD')
+  const paths = changed?.exitCode === 0 ? changed.stdout.split('\0').filter(Boolean) : []
+  const show = async (rev: string, path: string) => {
+    const run = await git('show', `${rev}:${path}`)
+
+    return run?.exitCode === 0 ? run.stdout : null
+  }
+  for (const [n, path] of paths.entries()) {
+    const file = `${commit.root}/${path}`
+    const before = await show('HEAD~1', path)
+    const after = await show('HEAD', path)
+    if (before?.includes('\0') || after?.includes('\0')) continue
+    const change = { id: `${made}:${n}`, tool: 'Revert' as const, file, isNew: before === null, isDeleted: after === null }
+    await record($, Number(time) > 0 ? { ...change, at: Number(time) * 1000 } : change, before ?? '', after ?? '')
+    const now = await readText($, file)
+    if (now === null) known.delete(file)
+    else known.set(file, now)
+  }
+  await checkCommit($, `${commit.root}/.`)
+  $.ui.toast(`Reverted ${hash} in a new commit, ${made}`)
+}
+
+// ---- Hooks ----
+
 export const register: Register = on => {
   // Last known text of each file the pane shows.
   const known = new Map<string, string>()
 
+
   on('session.start', async ($, e, next) => {
     await restore($)
     await checkCommits($).catch(() => {})
-    await $.command.register({ name: 'edits', description: 'Show the files Claude edited this session, with their diffs' })
-    void $.ui.open({ id: PANE, title: 'Edits' })
+    await $.command.register({ name: 'sidebar', description: 'Show the sidebar: files Claude edited, by file or commit, and the whole repository' })
+    void $.ui.open({ id: PANE, title: 'Sidebar' })
 
     return next(e)
   })
 
-  on('command.run', { command: 'edits' }, async $ => {
+  on('command.run', { command: 'sidebar' }, async $ => {
     await restore($)
     await checkCommits($).catch(() => {})
-    await $.ui.open({ id: PANE, title: 'Edits' })
+    await $.ui.open({ id: PANE, title: 'Sidebar' })
 
-    return { text: 'Edits pane opened.' }
+    return { text: 'Sidebar opened.' }
   })
 
   // Bash can change files too (sed, scripts, mv): snapshot the files it might touch, compare after.
@@ -389,8 +518,9 @@ export const register: Register = on => {
         }
       }
 
-      // The command may have committed.
+      // The command may have committed, or changed the repository's files.
       await checkCommits($)
+      if ((await read($, view)) === 'repo') await scan($)
     } catch {
       // As above.
     }
@@ -417,6 +547,7 @@ export const register: Register = on => {
       const after = r.content ?? (await readText($, r.filePath))
       await record($, { id: e.tool_use_id, tool: e.tool, file: r.filePath, isNew }, before, after, r.structuredPatch)
       if (after !== null) known.set(r.filePath, after)
+      if (isNew && (await read($, view)) === 'repo') await scan($)
     } catch {
       // Never let the tracker break the edit itself.
     }
@@ -427,27 +558,207 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Code } = $.ui.resolve(e)
     const list = await read($, edits)
-    if (list.length === 0) return <Text dimColor>No edits yet. Files Claude changes will show up here.</Text>
-
-    const open = await read($, expanded)
-    const focused = await read($, focus)
     const by = await read($, view)
-    const shut = await read($, folded)
     // One column spare so a row never touches the edge and wraps.
     const columns = Math.max(4, (e.props.bodyColumns ?? 40) - 1)
-    // A commit's line, pressed to fold its files away or back.
+
+    const tab = (name: 'files' | 'commits' | 'repo') => (
+      <Button
+        key={`view:${name}`}
+        plain
+        onPress={async () => {
+          await update($, view, () => name)
+          if (name === 'repo') await scan($)
+        }}
+      >
+        <Text bold={by === name} dimColor={by !== name} underline={by === name}>{name}</Text>
+      </Button>
+    )
+    const tabs = (
+      <Box flexWrap="nowrap">
+        {tab('files')}
+        <Text> </Text>
+        {tab('commits')}
+        <Text> </Text>
+        {tab('repo')}
+      </Box>
+    )
+
+    if (by === 'repo') {
+      const { root, files: all, isGit } = await read($, repo)
+      if (!root) {
+        return (
+          <Box flexDirection="column">
+            {tabs}
+            <Text dimColor>Listing the repository…</Text>
+          </Box>
+        )
+      }
+      const dirs = await read($, openDirs)
+      const shown = await read($, viewing)
+      const isDiff = isGit === true && (await read($, viewingDiff))
+      const edited = new Set(list.map(edit => edit.file))
+
+      // Each folder's folders and files, '' the root.
+      const inside = new Map<string, { dirs: Set<string>; files: string[] }>()
+      const at = (dir: string) => {
+        if (!inside.has(dir)) inside.set(dir, { dirs: new Set(), files: [] })
+
+        return inside.get(dir)!
+      }
+      at('')
+      for (const file of all) {
+        const parts = file.split('/')
+        for (let k = 1; k < parts.length; k++) at(parts.slice(0, k - 1).join('/')).dirs.add(parts.slice(0, k).join('/'))
+        at(parts.slice(0, -1).join('/')).files.push(file)
+      }
+
+      // The shown file's text, cut to what a Code element draws.
+      let source: string | null = null
+      if (shown) source = await readText($, `${root}/${shown}`)
+      const isCut = source !== null && source.length > MAX_SHOWN
+      if (source !== null && isCut) source = source.slice(0, source.lastIndexOf('\n', MAX_SHOWN))
+      // Its changes since the last commit, when asked for.
+      let sinceHead: Hunk[] = []
+      if (source !== null && isDiff) sinceHead = diffTexts(await committed($, `${root}/${shown}`), source)
+
+      // Folders first then files, each open folder's insides under it.
+      const rows: JSX.Element[] = []
+      const walk = (dir: string, depth: number) => {
+        const indent = '  '.repeat(depth)
+        for (const sub of [...at(dir).dirs].sort()) {
+          const isOpen = dirs.includes(sub)
+          const changed = [...edited].filter(file => file.startsWith(`${root}/${sub}/`)).length
+          rows.push(
+            <Button
+              key={`dir:${sub}`}
+              plain
+              onPress={() => update($, openDirs, cur => (cur.includes(sub) ? cur.filter(d => d !== sub) : [...cur, sub]))}
+            >
+              <Text wrap="truncate-end">
+                {indent}
+                {isOpen ? '▾' : '▸'} <Text color="suggestion">{sub.split('/').pop()}/</Text>
+                {changed > 0 && <Text color="warning"> ●</Text>}
+                {changed > 0 && <Text dimColor> {changed} edited</Text>}
+              </Text>
+            </Button>,
+          )
+          if (isOpen) walk(sub, depth + 1)
+        }
+        for (const file of at(dir).files) {
+          const isShown = file === shown
+          const isEdited = edited.has(`${root}/${file}`)
+          rows.push(
+            <Button key={`open:${file}`} plain onPress={() => update($, viewing, cur => (cur === file ? '' : file))}>
+              <Text wrap="truncate-end" bold={isShown}>
+                {indent}  <Text color={isEdited ? 'warning' : undefined}>{file.split('/').pop()}</Text>
+                {isEdited && <Text dimColor> edited</Text>}
+              </Text>
+            </Button>,
+          )
+          if (isShown) {
+            rows.push(
+              <Box key={`show:${file}`} flexDirection="column" paddingLeft={depth * 2 + 2}>
+                <Box flexWrap="nowrap">
+                  <Button key={`nvim:${file}`} plain onPress={() => openInNvim($, `${root}/${file}`)}>
+                    <Text color="suggestion">open in nvim</Text>
+                  </Button>
+                  <Text dimColor> │ </Text>
+                  <Button
+                    key={`explain:${file}`}
+                    plain
+                    onPress={() =>
+                      $.prompt.submit({
+                        text: `Explain ${root}/${file} to me: what it does, how it works, and how it fits into the project.`,
+                      })
+                    }
+                  >
+                    <Text color="suggestion">explain</Text>
+                  </Button>
+                  {isGit && <Text dimColor> │ </Text>}
+                  {isGit && (
+                    <Button key={`asfile:${file}`} plain onPress={() => update($, viewingDiff, () => false)}>
+                      <Text bold={!isDiff} dimColor={isDiff} underline={!isDiff}>file</Text>
+                    </Button>
+                  )}
+                  {isGit && <Text> </Text>}
+                  {isGit && (
+                    <Button key={`asdiff:${file}`} plain onPress={() => update($, viewingDiff, () => true)}>
+                      <Text bold={isDiff} dimColor={!isDiff} underline={isDiff}>diff vs HEAD</Text>
+                    </Button>
+                  )}
+                </Box>
+                {source === null && <Text dimColor>Not shown: binary, over {MAX_FILE / 1_000_000} MB, or missing.</Text>}
+                {source !== null && !isDiff && <Code source={source} path={file} startLine={1} />}
+                {source !== null && isDiff && sinceHead.length === 0 && <Text dimColor>No changes since the last commit.</Text>}
+                {source !== null && isDiff && sinceHead.length > 0 && <Code source={diffSource(sinceHead)} format="diff" path={file} />}
+                {isCut && <Text dimColor>… cut at {MAX_SHOWN / 1000}k characters</Text>}
+              </Box>,
+            )
+          }
+        }
+      }
+      walk('', 0)
+
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text bold wrap="truncate-end">
+            {fitPath(root, columns - 12)} <Text dimColor>{all.length} files</Text>
+          </Text>
+          {rows}
+        </Box>
+      )
+    }
+
+    if (list.length === 0) {
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text dimColor>No edits yet. Files Claude changes will show up here.</Text>
+        </Box>
+      )
+    }
+    const open = await read($, expanded)
+    const focused = await read($, focus)
+    const shut = await read($, folded)
+    const seen = await read($, commits)
+    const armed = await read($, arming)
+    // A commit's line, pressed to fold its files away or back, ending in a button that reverts the commit
+    // on a second press.
     const breakLine = (label: string, count: number) => {
       const isShut = shut.includes(label)
       const text = `${isShut ? '▸' : '▾'} ${label}${isShut ? ` (${count} file${count === 1 ? '' : 's'})` : ''}`
+      // The button is dropped before the line is cut, as the extras of a file's row are.
+      const found = seen.find(c => c.commit === label)
+      const isArmed = found !== undefined && armed === label
+      const wanted = isArmed ? ' press again to revert' : ' revert'
+      const commit = found !== undefined && text.length + 2 + wanted.length <= columns ? found : undefined
+      const action = commit === undefined ? '' : wanted
 
       return (
-        <Button
-          key={`commit:${label}`}
-          plain
-          onPress={() => update($, folded, cur => (cur.includes(label) ? cur.filter(l => l !== label) : [...cur, label]))}
-        >
-          <Text dimColor wrap="truncate-end">{`${text} ${'─'.repeat(Math.max(0, columns - text.length - 1))}`}</Text>
-        </Button>
+        <Box key={`line:${label}`} flexWrap="nowrap">
+          <Button
+            key={`commit:${label}`}
+            plain
+            onPress={() => update($, folded, cur => (cur.includes(label) ? cur.filter(l => l !== label) : [...cur, label]))}
+          >
+            <Text dimColor wrap="truncate-end">{`${text} ${'─'.repeat(Math.max(0, columns - text.length - 1 - action.length))}`}</Text>
+          </Button>
+          {commit !== undefined && (
+            <Button
+              key={`revert:${label}`}
+              plain
+              onPress={async () => {
+                if (!isArmed) return update($, arming, () => label)
+                await update($, arming, () => '')
+                await revertCommit($, known, commit)
+              }}
+            >
+              <Text color={isArmed ? 'error' : 'suggestion'} bold={isArmed}>{action}</Text>
+            </Button>
+          )}
+        </Box>
       )
     }
 
@@ -504,19 +815,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box flexWrap="nowrap">
-          <Text bold>
-            {files.length} file{files.length === 1 ? '' : 's'}
-          </Text>
-          <Text dimColor> │ </Text>
-          <Button key="view:files" plain onPress={() => update($, view, () => 'files')}>
-            <Text bold={by === 'files'} dimColor={by !== 'files'} underline={by === 'files'}>files</Text>
-          </Button>
-          <Text> </Text>
-          <Button key="view:commits" plain onPress={() => update($, view, () => 'commits')}>
-            <Text bold={by === 'commits'} dimColor={by !== 'commits'} underline={by === 'commits'}>commits</Text>
-          </Button>
-        </Box>
+        {tabs}
         {rows.map(({ key, file, fileEdits, bucket, header }) => {
           // A folded commit shows only its line.
           if (bucket !== undefined && shut.includes(bucket)) return header !== undefined && breakLine(bucket, header)
@@ -550,6 +849,13 @@ export const register: Register = on => {
           // Picking another edit shows it; picking the shown one again folds it away.
           const pick = (k: number) =>
             setFocus(key, k === idx ? { isHidden: !isHidden } : { id: fileEdits[k].id, isHidden: false })
+          const why = () =>
+            $.prompt.submit({
+              text: [
+                `Why did you make edit #${number.get(edit.id)} to ${file} (at ${clockTime(edit.at)})? Explain the reasoning behind it, then review it for problems.`,
+                ...(edit.hunks.length > 0 ? ['', '```diff', diffSource(edit.hunks), '```'] : []),
+              ].join('\n'),
+            })
 
           let view = <Text dimColor>No textual changes.</Text>
           if (mode === 'diff' && edit.hunks.length > 0) {
@@ -613,6 +919,17 @@ export const register: Register = on => {
                     <Button key={`file:${key}`} plain onPress={() => setFocus(key, { mode: 'file', isHidden: false })}>
                       <Text bold={mode === 'file'} dimColor={mode !== 'file'} underline={mode === 'file'}>file</Text>
                     </Button>
+                  </Box>
+                  <Box flexWrap="nowrap">
+                    <Button key={`why:${key}`} plain onPress={why}>
+                      <Text color="suggestion">why?</Text>
+                    </Button>
+                    {!latest.isDeleted && <Text dimColor> │ </Text>}
+                    {!latest.isDeleted && (
+                      <Button key={`nvim:${key}`} plain onPress={() => openInNvim($, file, firstChange(edit.hunks))}>
+                        <Text color="suggestion">open in nvim</Text>
+                      </Button>
+                    )}
                   </Box>
                   {!isHidden && view}
                   {!isHidden && mode === 'diff' && edit.hunks.reduce((n, h) => n + h.lines.length, 0) >= MAX_DIFF_LINES && (

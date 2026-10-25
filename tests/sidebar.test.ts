@@ -1,17 +1,27 @@
 import { expect, test } from 'claude-code/testing'
 
-const PLUGIN = 'edit-tracker-for-claude'
+const PLUGIN = 'sidebar-for-claude'
 const PANE = {
   component: 'Pane',
-  requestId: 'edits',
-  props: { title: 'Edits', isFocused: false, bodyColumns: 80, placement: 'dock' },
+  requestId: 'sidebar',
+  props: { title: 'Sidebar', isFocused: false, bodyColumns: 80, placement: 'dock' },
 }
 
 // An in-memory disk standing in for the file system, git (a repo at /repo when `isRepo`) and the session.
 const fake = (on: any, isRepo: boolean) => {
   const disk = new Map<string, string>()
   // Commits newest first, each with its time in seconds.
-  const repo = { commits: [['aaaaaaa', 0, 'First commit']] as [string, number, string][] }
+  const opened: string[] = []
+  // The line each opened file was opened at.
+  const lines: string[] = []
+  // Files as git has them by `REV:/path`, the files the last commit changed, what a revert does, and every git call.
+  const repo = {
+    commits: [['aaaaaaa', 0, 'First commit']] as [string, number, string][],
+    blobs: new Map<string, string>(),
+    changed: [] as string[],
+    revert: (hash: string): { exitCode: number; stderr?: string } => ({ exitCode: 128 }),
+    calls: [] as string[],
+  }
   const found = (path: string) => {
     const text = disk.get(path)
     if (text === undefined) throw new Error('missing')
@@ -34,7 +44,29 @@ const fake = (on: any, isRepo: boolean) => {
   on('process.run', ($: unknown, e: any) => {
     if (e.argv[0] === 'printenv') return done(0, '/home/me\n')
     if (!isRepo) return done(128)
+    if (e.argv[0] === 'git') repo.calls.push(e.argv.slice(1).join(' '))
     if (e.argv[1] === 'rev-parse') return done(0, '/repo\n')
+    if (e.argv[0] === 'sh' && e.argv[1] === '-c') {
+      opened.push(e.argv[4])
+      lines.push(e.argv[5])
+
+      return done(0, 'the running nvim\n')
+    }
+    if (e.argv[1] === 'ls-files') return done(0, 'README.md\0src/app.py\0src/lib/util.py\0')
+    if (e.argv[1] === 'show') {
+      const [rev, path] = e.argv[2].split(':')
+      const text = repo.blobs.get(`${rev}:${path.startsWith('./') ? `${e.init?.cwd}/${path.slice(2)}` : `/repo/${path}`}`)
+
+      return text === undefined ? done(128) : done(0, text)
+    }
+    if (e.argv[1] === 'revert' && e.argv[2] === '--abort') return done(0)
+    if (e.argv[1] === 'revert') {
+      const { exitCode, stderr = '' } = repo.revert(e.argv[3])
+
+      return { value: { exitCode, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (e.argv[1] === 'diff') return done(0, repo.changed.map(f => `${f}\0`).join(''))
+    if (e.argv[1] === 'log' && e.argv[2] === '-1') return done(0, `${repo.commits[0][0]}\0${repo.commits[0][1]}\n`)
     if (e.argv[1] === 'log') return done(0, repo.commits.map(c => `${c.join('\0')}\n`).join(''))
     if (e.argv[1] === 'status') {
       const files = [...disk.keys()].filter(f => f.startsWith('/repo/'))
@@ -54,7 +86,7 @@ const fake = (on: any, isRepo: boolean) => {
       return { result: result ?? { stdout: '', stderr: '', interrupted: false } }
     })
   }
-  return { disk, repo, setEffect: (change: () => unknown) => (effect = change as () => void) }
+  return { disk, repo, opened, lines, setEffect: (change: () => unknown) => (effect = change as () => void) }
 }
 
 const mount = async ($: any, bodyColumns = 80) =>
@@ -201,7 +233,7 @@ test('rows stay on one line and keep the file name in a thin pane', async ($, on
 
 test('each edit is saved to disk', async ($, on) => {
   const { disk, setEffect } = fake(on, false)
-  const saved = '/home/me/.local/share/edit-tracker-for-claude/s1.json'
+  const saved = '/home/me/.local/share/sidebar-for-claude/s1.json'
   disk.set('/home/me/a.py', 'a\n')
   setEffect(() => {
     disk.set('/home/me/a.py', 'b\n')
@@ -220,10 +252,172 @@ test('an empty pane gets the saved edits back', async ($, on) => {
     id: 'x', file: '/home/me/a.py', tool: 'Edit', isNew: false, added: 1, removed: 1, at: 0,
     hunks: [{ oldStart: 1, newStart: 1, lines: ['-a', '+b'] }],
   }
-  disk.set('/home/me/.local/share/edit-tracker-for-claude/s1.json', JSON.stringify([edit]))
+  disk.set('/home/me/.local/share/sidebar-for-claude/s1.json', JSON.stringify([edit]))
 
-  await $.command.run({ command: 'edits', args: '' } as never)
+  await $.command.run({ command: 'sidebar', args: '' } as never)
   const ui = await mount($)
   expect(await rows(ui)).toEqual(['▸ ~/a.py +1 -1'])
+  await ui.unmount()
+})
+
+test('the repo tab shows the folder tree and opens a file', async ($, on) => {
+  const { disk, opened, setEffect } = fake(on, true)
+  const asked: string[] = []
+  const toasts: string[] = []
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('prompt.submit', ($: unknown, e: any) => {
+    asked.push(e.text)
+
+    return { text: e.text }
+  })
+  on('ui.toast', ($: unknown, e: any) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  disk.set('/repo/src/app.py', 'print(1)\n')
+  setEffect(() => {
+    disk.set('/repo/src/app.py', 'print(2)\n')
+
+    return { filePath: '/repo/src/app.py', oldString: '1', newString: '2', originalFile: 'print(1)\n', structuredPatch: [] }
+  })
+  await $.tool.call({ tool: 'Edit', input: { file_path: '/repo/src/app.py', old_string: '1', new_string: '2' } } as never)
+
+  const ui = await mount($)
+  await ui.press({ key: 'view:repo' })
+  const tree = async () =>
+    (await ui.findAll({ type: 'Button' })).filter((b: any) => /^(dir|open):/.test(b.key)).map((b: any) => b.text)
+  expect(await tree()).toEqual(['▸ src/ ● 1 edited', '  README.md'])
+  await ui.press({ key: 'dir:src' })
+  expect(await tree()).toEqual(['▾ src/ ● 1 edited', '  ▸ lib/', '    app.py edited', '  README.md'])
+  await ui.press({ key: 'open:src/app.py' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('print(2)\n')
+
+  // An open file's menu opens it in nvim, or asks Claude to explain it.
+  await ui.press({ key: 'nvim:src/app.py' })
+  expect(opened).toEqual(['/repo/src/app.py'])
+  expect(toasts).toEqual(['Opened /repo/src/app.py in the running nvim'])
+  await ui.press({ key: 'explain:src/app.py' })
+  expect(asked).toEqual(['Explain /repo/src/app.py to me: what it does, how it works, and how it fits into the project.'])
+  await ui.press({ key: 'open:src/app.py' })
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an edit can be asked about and opened at its line', async ($, on) => {
+  const { disk, opened, lines, setEffect } = fake(on, true)
+  const asked: string[] = []
+  on('prompt.submit', ($: unknown, e: any) => {
+    asked.push(e.text)
+
+    return { text: e.text }
+  })
+  const call = async (tool: string, input: object, change: () => unknown) => {
+    setEffect(change)
+    await $.tool.call({ tool, input } as never)
+  }
+  await call('Write', { file_path: '/repo/a.py', content: '' }, () => {
+    disk.set('/repo/a.py', 'a\nb\nc\n')
+
+    return { type: 'create', filePath: '/repo/a.py', content: 'a\nb\nc\n', structuredPatch: [], originalFile: null }
+  })
+  await call('Edit', { file_path: '/repo/a.py', old_string: 'c', new_string: 'C' }, () => {
+    disk.set('/repo/a.py', 'a\nb\nC\n')
+
+    return { filePath: '/repo/a.py', oldString: 'c', newString: 'C', originalFile: 'a\nb\nc\n', structuredPatch: [] }
+  })
+
+  const ui = await mount($)
+  await ui.press({ key: 'toggle:/repo/a.py' })
+  const text = async (key: string) => (await ui.find({ type: 'Button', key }))?.text
+
+  // Asking why sends the edit's diff along.
+  await ui.press({ key: 'why:/repo/a.py' })
+  expect(asked[0]).toMatch(/^Why did you make edit #2 to \/repo\/a.py \(at \d\d:\d\d:\d\d\)\?/)
+  expect(asked[0]).toContain('```diff\n@@ -1,3 +1,3 @@\n a\n b\n-c\n+C\n```')
+
+  // Opened at the first changed line.
+  await ui.press({ key: 'nvim:/repo/a.py' })
+  expect([opened, lines]).toEqual([['/repo/a.py'], ['3']])
+
+  await ui.unmount()
+})
+
+test('the repo tab shows a file\'s changes since the last commit', async ($, on) => {
+  const { disk, repo } = fake(on, true)
+  on('session.cwd', () => ({ value: '/repo' }))
+  disk.set('/repo/README.md', 'one\ntwo\n')
+  repo.blobs.set('HEAD:/repo/README.md', 'one\n')
+
+  const ui = await mount($)
+  await ui.press({ key: 'view:repo' })
+  await ui.press({ key: 'open:README.md' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('one\ntwo\n')
+  await ui.press({ key: 'asdiff:README.md' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('@@ -1,1 +1,2 @@\n one\n+two')
+  repo.blobs.set('HEAD:/repo/README.md', 'one\ntwo\n')
+  await ui.press({ key: 'asdiff:README.md' })
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  await ui.press({ key: 'asfile:README.md' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('one\ntwo\n')
+  await ui.unmount()
+})
+
+test('a commit is reverted on a second press, in a new commit holding the files it puts back', async ($, on) => {
+  const { disk, repo, setEffect } = fake(on, true)
+  const toasts: string[] = []
+  on('ui.toast', ($: unknown, e: any) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  disk.set('/repo/a.py', 'a\n')
+  setEffect(() => {
+    disk.set('/repo/a.py', 'b\n')
+
+    return { filePath: '/repo/a.py', oldString: 'a', newString: 'b', originalFile: 'a\n', structuredPatch: [] }
+  })
+  await $.tool.call({ tool: 'Edit', input: { file_path: '/repo/a.py', old_string: 'a', new_string: 'b' } } as never)
+  const now = Math.floor(Date.now() / 1000)
+  repo.commits.unshift(['bbbbbbb', now + 1, 'Change a'])
+  setEffect(() => {})
+  await $.tool.call({ tool: 'Bash', input: { command: 'git commit -am "Change a"' } } as never)
+
+  const ui = await mount($)
+  await ui.press({ key: 'view:commits' })
+  const text = async (key: string) => (await ui.find({ type: 'Button', key }))?.text
+  const lines = async () =>
+    (await ui.findAll({ type: 'Text' })).map((t: any) => t.text).filter((t: string) => /^[▸▾] .* ─+$/.test(t)).map((t: string) => t.replace(/ ─+$/, ''))
+  expect(await lines()).toEqual(['▾ bbbbbbb Change a'])
+
+  // Git refusing the revert is aborted and its reason shown.
+  repo.revert = () => ({ exitCode: 1, stderr: 'error: your local changes would be overwritten by revert.\n' })
+  expect(await text('revert:bbbbbbb Change a')).toBe(' revert')
+  await ui.press({ key: 'revert:bbbbbbb Change a' })
+  expect(await text('revert:bbbbbbb Change a')).toBe(' press again to revert')
+  expect(repo.calls.filter(c => c.startsWith('revert'))).toEqual([])
+  await ui.press({ key: 'revert:bbbbbbb Change a' })
+  expect(repo.calls.filter(c => c.startsWith('revert'))).toEqual(['revert --no-edit bbbbbbb', 'revert --abort'])
+  expect(toasts.at(-1)).toBe("Couldn't revert bbbbbbb: your local changes would be overwritten by revert.")
+  expect(await text('revert:bbbbbbb Change a')).toBe(' revert')
+
+  // A clean revert lands as a new commit, its files under it.
+  repo.revert = () => {
+    disk.set('/repo/a.py', 'a\n')
+    repo.commits.unshift(['ccccccc', now + 2, 'Revert "Change a"'])
+    repo.changed = ['a.py']
+    repo.blobs.set('HEAD~1:/repo/a.py', 'b\n')
+    repo.blobs.set('HEAD:/repo/a.py', 'a\n')
+
+    return { exitCode: 0 }
+  }
+  await ui.press({ key: 'revert:bbbbbbb Change a' })
+  await ui.press({ key: 'revert:bbbbbbb Change a' })
+  expect(toasts.at(-1)).toBe('Reverted bbbbbbb in a new commit, ccccccc')
+  expect(await lines()).toEqual(['▾ ccccccc Revert "Change a"', '▾ bbbbbbb Change a'])
+  await ui.press({ key: 'toggle:ccccccc Revert "Change a"\t/repo/a.py' })
+  const records = (await ui.findAll({ type: 'Button' })).filter((b: any) => /^rec:/.test(b.key))
+  expect(records.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['● #2 T revert +1 -1'])
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('@@ -1,1 +1,1 @@\n-b\n+a')
   await ui.unmount()
 })
