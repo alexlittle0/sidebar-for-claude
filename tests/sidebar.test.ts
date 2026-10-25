@@ -118,7 +118,7 @@ test('edits list newest first, step through time, fold, and show the whole file'
 
   await ui.press({ key: 'toggle:/repo/a.py' })
   const records = (await ui.findAll({ type: 'Button' })).filter((b: any) => /^rec:/.test(b.key))
-  expect(records.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['○ #1 T write +2 -0', '● #2 T shell +1 -0'])
+  expect(records.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['● #2 T shell +1 -0', '○ #1 T write +2 -0'])
   const docstring = '@@ -1,2 +1,3 @@\n def f():\n+    """Return one."""\n     return 1'
   expect((await ui.find({ type: 'Code' }))?.props.source).toBe(docstring)
 
@@ -129,7 +129,7 @@ test('edits list newest first, step through time, fold, and show the whole file'
   expect((await ui.find({ type: 'Code' }))?.props.source).toBe(docstring)
   await ui.press({ key: 'diff:/repo/a.py' })
 
-  await ui.press({ key: records[1].key })
+  await ui.press({ key: records[0].key })
   expect(await ui.find({ type: 'Code' })).toBeUndefined()
   await ui.press({ key: 'fold:/repo/a.py' })
   expect(await ui.find({ type: 'Code' })).toBeDefined()
@@ -158,15 +158,15 @@ test('edits list newest first, step through time, fold, and show the whole file'
   await committed.press({ key: 'view:commits' })
   expect(await listed(committed)).toEqual(['▾ uncommitted', '/repo/a.py', '▾ bbbbbbb Add docstring', '/repo/b.txt', '/repo/a.py'])
 
-  // A commit folds its files away behind its line.
+  // A commit folds its files away behind its line, its name cut to keep the revert button.
   await committed.press({ key: 'commit:bbbbbbb Add docstring' })
-  expect(await listed(committed)).toEqual(['▾ uncommitted', '/repo/a.py', '▸ bbbbbbb Add docstring (2 files)'])
+  expect(await listed(committed)).toEqual(['▾ uncommitted', '/repo/a.py', '▸ bbbbbbb Add docst… (2 files)'])
   await committed.press({ key: 'commit:bbbbbbb Add docstring' })
 
   // A file under a commit steps through only that commit's edits, numbered as in its whole history.
   await committed.press({ key: 'toggle:bbbbbbb Add docstring\t/repo/a.py' })
   const picked = (await committed.findAll({ type: 'Button' })).filter((b: any) => /^rec:/.test(b.key))
-  expect(picked.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['○ #1 T write +2 -0', '● #2 T shell +1 -0'])
+  expect(picked.map((b: any) => b.text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual(['● #2 T shell +1 -0', '○ #1 T write +2 -0'])
   await committed.press({ key: 'view:files' })
   await committed.unmount()
 

@@ -728,13 +728,16 @@ export const register: Register = on => {
     // on a second press.
     const breakLine = (label: string, count: number) => {
       const isShut = shut.includes(label)
-      const text = `${isShut ? '▸' : '▾'} ${label}${isShut ? ` (${count} file${count === 1 ? '' : 's'})` : ''}`
-      // The button is dropped before the line is cut, as the extras of a file's row are.
+      const files = isShut ? ` (${count} file${count === 1 ? '' : 's'})` : ''
       const found = seen.find(c => c.commit === label)
       const isArmed = found !== undefined && armed === label
       const wanted = isArmed ? ' press again to revert' : ' revert'
-      const commit = found !== undefined && text.length + 2 + wanted.length <= columns ? found : undefined
+      // A long commit name is cut to keep the button; the button goes only when not even the hash would fit.
+      const room = columns - 4 - files.length - wanted.length
+      const commit = found !== undefined && room >= label.split(' ')[0].length + 1 ? found : undefined
       const action = commit === undefined ? '' : wanted
+      const name = commit !== undefined && label.length > room ? `${label.slice(0, room - 1).trimEnd()}…` : label
+      const text = `${isShut ? '▸' : '▾'} ${name}${files}`
 
       return (
         <Box key={`line:${label}`} flexWrap="nowrap">
@@ -887,7 +890,8 @@ export const register: Register = on => {
               </Button>
               {isOpen && (
                 <Box flexDirection="column" paddingLeft={2}>
-                  {fileEdits.map((one, k) => (
+                  {/* Newest first, as everything in the pane is. */}
+                  {[...fileEdits.entries()].reverse().map(([k, one]) => (
                     <Button key={`rec:${one.id}`} plain onPress={() => pick(k)}>
                       <Text wrap="truncate-end" bold={k === idx} dimColor={k !== idx}>
                         {k === idx ? '●' : '○'} #{number.get(one.id)} {clockTime(one.at)} {TOOL_LABEL[one.tool]}
