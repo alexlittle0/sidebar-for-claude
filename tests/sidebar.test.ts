@@ -442,8 +442,13 @@ test('a commit is reverted on a second press, in a new commit holding the files 
 test('the prompts tab groups each prompt\'s files under it, newest first', async ($, on) => {
   const { disk, setEffect } = fake(on, true)
   let now = 1_000_000
+  const asked: string[] = []
   on('clock.now', () => ({ value: now }))
-  on('prompt.submit', ($: unknown, e: any) => ({ text: e.text }))
+  on('prompt.submit', ($: unknown, e: any) => {
+    asked.push(e.text)
+
+    return { text: e.text }
+  })
   const edit = async (file: string, text: string) => {
     now += 1000
     setEffect(() => {
@@ -480,6 +485,16 @@ test('the prompts tab groups each prompt\'s files under it, newest first', async
     '▾ T Add a parser', '/repo/test_parse.py', '/repo/parse.py',
     '▾ before the first prompt seen', '/repo/old.py',
   ])
+  // A prompt's buttons ask Claude about all of its changes, or to commit them, with each file's diff.
+  await ui.press({ key: 'why:prompt:1002000' })
+  await ui.press({ key: 'commitprompt:prompt:1002000' })
+  const files = ['/repo/test_parse.py', '```diff', '@@ -0,0 +1,1 @@', '+t', '```', '/repo/parse.py', '```diff', '@@ -0,0 +1,1 @@', '+p', '```']
+  expect(asked.slice(1).map(text => text.replace(/\d\d:\d\d:\d\d/, 'T'))).toEqual([
+    ['Explain what you changed for this prompt of mine and why, then review the changes for problems. My prompt was (at T):',
+      '', 'Add a parser', '', 'The files it changed:', '', ...files].join('\n'),
+    expect.stringMatching(/^Commit the changes you made for this prompt of mine: only the files below.*\n\nAdd a parser\n\nThe files it changed:\n\n\/repo\/test_parse.py\n/),
+  ])
+
   await ui.press({ key: 'commit:prompt:1002000' })
   expect(await lines()).toEqual([
     '▾ T Fix the README', '/repo/README.md', '▸ T Add a parser (2 files)', '▾ before the first prompt seen', '/repo/old.py',
