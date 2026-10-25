@@ -36,8 +36,8 @@ const commits = atom({ plugin: 'sidebar-for-claude', key: 'commits' } as const, 
 const view = atom({ plugin: 'sidebar-for-claude', key: 'view' } as const, 'prompts' as 'prompts' | 'files' | 'commits' | 'repo')
 // The prompts that started each turn, oldest first.
 const prompts = atom({ plugin: 'sidebar-for-claude', key: 'prompts' } as const, [] as Prompt[])
-// Whether the pane was closed, by /sidebar or by hand, so a reload leaves it closed.
-const isClosed = atom({ plugin: 'sidebar-for-claude', key: 'isClosed' } as const, false)
+// Whether /sidebar opened the pane and it hasn't been closed since, so a reload puts it back. A new session starts closed.
+const isOpen = atom({ plugin: 'sidebar-for-claude', key: 'isOpen' } as const, false)
 // The commits folded away in the commits view.
 const folded = atom({ plugin: 'sidebar-for-claude', key: 'folded' } as const, [] as string[])
 const repo = atom({ plugin: 'sidebar-for-claude', key: 'repo' } as const, { root: '', files: [] } as Repo)
@@ -505,7 +505,7 @@ export const register: Register = on => {
     await restore($)
     await checkCommits($).catch(() => {})
     await $.command.register({ name: 'sidebar', description: 'Show or hide the sidebar: files Claude edited, by prompt, file or commit, and the whole repository' })
-    if (!(await read($, isClosed))) void $.ui.open({ id: PANE, title: 'Sidebar' })
+    if (await read($, isOpen)) void $.ui.open({ id: PANE, title: 'Sidebar' })
 
     return next(e)
   })
@@ -539,14 +539,14 @@ export const register: Register = on => {
     }
     await restore($)
     await checkCommits($).catch(() => {})
-    await update($, isClosed, () => false)
+    await update($, isOpen, () => true)
     await $.ui.open({ id: PANE, title: 'Sidebar' })
 
     return { text: 'Sidebar opened.' }
   })
 
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE && e.origin.kind !== 'unload') await update($, isClosed, () => true)
+    if (e.id === PANE && e.origin.kind !== 'unload') await update($, isOpen, () => false)
 
     return next(e)
   })

@@ -32,7 +32,7 @@ declare module 'claude-code' {
   interface PluginState {
     'sidebar-for-claude': {
       edits: FileEdit[]; expanded: string[]; focus: Record<string, FileFocus>; commits: Commit[]; view: 'prompts' | 'files' | 'commits' | 'repo'; folded: string[]
-      repo: Repo; openDirs: string[]; viewing: string; viewingDiff: boolean; arming: string; prompts: Prompt[]; isClosed: boolean
+      repo: Repo; openDirs: string[]; viewing: string; viewingDiff: boolean; arming: string; prompts: Prompt[]; isOpen: boolean
     }
   }
 }

@@ -499,18 +499,20 @@ test('the prompts tab groups each prompt\'s files under it, newest first', async
   await ui.unmount()
 })
 
-test('/sidebar opens the pane, closes it when open, and a closed pane stays closed', async ($, on) => {
+test('the pane starts closed, /sidebar toggles it, and a reload keeps it as it was', async ($, on) => {
   const { panes } = fake(on, false)
   on('command.register', () => ({ value: undefined }))
   on('session.start', ($: unknown, e: any) => e)
+  await $.session.start({ cwd: '/home/me' } as never)
+  expect([...panes]).toEqual([])
+  expect(await $.command.run({ command: 'sidebar', args: '' } as never)).toEqual({ text: 'Sidebar opened.' })
+  expect([...panes]).toEqual(['sidebar'])
   await $.session.start({ cwd: '/home/me' } as never)
   expect([...panes]).toEqual(['sidebar'])
   expect(await $.command.run({ command: 'sidebar', args: '' } as never)).toEqual({ text: 'Sidebar closed.' })
   expect([...panes]).toEqual([])
   await $.session.start({ cwd: '/home/me' } as never)
   expect([...panes]).toEqual([])
-  expect(await $.command.run({ command: 'sidebar', args: '' } as never)).toEqual({ text: 'Sidebar opened.' })
-  expect([...panes]).toEqual(['sidebar'])
 })
 
 test('an open prompt shows the whole prompt, how long its turn took and the commands it ran', async ($, on) => {
